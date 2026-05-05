@@ -10,9 +10,11 @@ This directory contains the NeMo Flow integration patch for
 
 The patch adds optional NeMo Flow tracing, LLM stream wrapping, tool execution
 wrapping, raw ATOF JSONL export, and optional direct ATIF export support to the
-opencode package. It depends on the local NeMo Flow Node binding through a
-`file:` dependency that resolves from `third_party/opencode/packages/opencode`
-back to `crates/node`.
+opencode package. To keep the third-party patch minimal and reproducible, the
+patch does not add a `file:` dependency on the local NeMo Flow Node package.
+At runtime it first tries an installed `nemo-flow-node` package and then falls
+back to the local NeMo Flow Node build under `crates/node`, resolved relative to
+the patched integration module.
 
 ## Setup
 
@@ -39,6 +41,9 @@ cd ../../crates/node
 npm install
 npm run build
 ```
+
+Set `NEMO_FLOW_NODE_DIR` to override the fallback and point directly at the
+directory containing the built NeMo Flow Node package.
 
 Enable the integration at runtime with either `NEMO_FLOW_ENABLED=1` or the
 opencode experimental `nemo_flow` config flag. If the native addon is missing,
