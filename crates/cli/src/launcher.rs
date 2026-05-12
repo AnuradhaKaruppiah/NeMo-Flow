@@ -329,7 +329,7 @@ impl PreparedRun {
             args.push("--config".to_string());
             args.push(format!("hooks.{event}={}", hook_groups_toml(groups)));
         }
-        insert_after_agent(&mut self.argv, CodingAgent::Codex, args);
+        insert_after_codex_config_target(&mut self.argv, args);
     }
 
     // Temporarily merges Cursor hooks into the nearest project `.cursor/hooks.json`, backing up the
@@ -504,6 +504,28 @@ fn insert_after_agent(
         .next_back()
         .unwrap_or(0);
     argv.splice(index + 1..index + 1, args);
+}
+
+// Codex does not inherit top-level `--config` overrides into `codex exec`.
+// For non-interactive sessions, inject after the `exec` subcommand so provider
+// routing and hooks are visible to the process that actually starts the turn.
+fn insert_after_codex_config_target(
+    argv: &mut Vec<String>,
+    args: impl IntoIterator<Item = String>,
+) {
+    let agent_index = argv
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            (CodingAgent::infer(arg) == Some(CodingAgent::Codex)).then_some(index)
+        })
+        .next_back()
+        .unwrap_or(0);
+    let insert_index = match argv.get(agent_index + 1).map(String::as_str) {
+        Some("exec" | "e") => agent_index + 2,
+        _ => agent_index + 1,
+    };
+    argv.splice(insert_index..insert_index, args);
 }
 
 // Writes pretty JSON hook config to a path whose parent has already been created by the caller.

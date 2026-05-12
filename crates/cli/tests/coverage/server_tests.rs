@@ -258,6 +258,134 @@ async fn gateway_accepts_codex_responses_path() {
 }
 
 #[tokio::test]
+async fn gateway_avoids_duplicate_openai_v1_prefix() {
+    let upstream = spawn_upstream(false).await;
+    let mut config = test_config();
+    config.openai_base_url = format!("{}/v1", upstream.url());
+    let app = router(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-test",
+                        "input": "hello"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["model"], json!("gpt-test"));
+}
+
+#[tokio::test]
+async fn gateway_strips_codex_client_metadata_upstream() {
+    let upstream = spawn_upstream(false).await;
+    let mut config = test_config();
+    config.openai_base_url = upstream.url();
+    let app = router(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-test",
+                        "input": "hello",
+                        "client_metadata": {"codex": "0.130.0"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["client_metadata"], Value::Null);
+}
+
+#[tokio::test]
+async fn gateway_reorders_codex_tool_result_history_upstream() {
+    let upstream = spawn_upstream(false).await;
+    let mut config = test_config();
+    config.openai_base_url = upstream.url();
+    let app = router(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-test",
+                        "input": [
+                            {
+                                "type": "function_call",
+                                "call_id": "call-1",
+                                "name": "exec_command",
+                                "arguments": "{}"
+                            },
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "I will inspect the file."
+                                    }
+                                ]
+                            },
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "Warning: use apply_patch directly."
+                                    }
+                                ]
+                            },
+                            {
+                                "type": "function_call_output",
+                                "call_id": "call-1",
+                                "output": "ok"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input[0]["type"], json!("message"));
+    assert_eq!(input[1]["type"], json!("message"));
+    assert_eq!(input[2]["type"], json!("function_call"));
+    assert_eq!(input[3]["type"], json!("function_call_output"));
+}
+
+#[tokio::test]
 async fn gateway_preserves_streaming_body() {
     let upstream = spawn_upstream(true).await;
     let mut config = test_config();
@@ -403,6 +531,8 @@ async fn spawn_upstream(streaming: bool) -> TestServer {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         Json(json!({
             "model": payload["model"],
+            "input": payload.get("input").cloned().unwrap_or(Value::Null),
+            "client_metadata": payload.get("client_metadata").cloned().unwrap_or(Value::Null),
             "authorization": headers
                 .get(header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok()),

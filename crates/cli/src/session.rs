@@ -331,6 +331,18 @@ impl SessionManager {
         }
     }
 
+    /// Writes cumulative ATIF snapshots for open sessions without closing them.
+    ///
+    /// Transparent run mode calls this during gateway shutdown so agents that do not emit a
+    /// reliable terminal hook still leave the latest observed trajectory on disk.
+    pub(crate) async fn snapshot_open_sessions(&self) -> Result<(), CliError> {
+        let mut sessions = self.inner.lock().await;
+        for session in sessions.values_mut() {
+            session.snapshot_atif()?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn open_session_count(&self) -> usize {
         self.inner.lock().await.len()

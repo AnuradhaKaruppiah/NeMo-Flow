@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
 use axum::body::{Body, Bytes};
@@ -29,6 +34,7 @@ use crate::server::AppState;
 use crate::session::{GatewayCallPrep, LlmGatewayStart};
 
 const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+static DEBUG_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Proxies supported LLM API requests through NeMo Flow's managed execution pipeline.
 ///
@@ -81,6 +87,7 @@ async fn prepare_gateway_request(
         .await
         .map_err(|error| CliError::InvalidPayload(error.to_string()))?;
     let request_json = serde_json::from_slice::<Value>(&body_bytes).unwrap_or(Value::Null);
+    let upstream_body_bytes = upstream_body_bytes(provider, &request_json, &body_bytes);
     let upstream_url = provider.upstream_url(
         config,
         parts
@@ -99,10 +106,86 @@ async fn prepare_gateway_request(
         path: parts.uri.path().to_string(),
         provider,
         upstream_url,
-        body_bytes,
+        body_bytes: upstream_body_bytes,
         request_json,
         streaming,
     })
+}
+
+fn upstream_body_bytes(provider: ProviderRoute, request_json: &Value, body_bytes: &Bytes) -> Bytes {
+    if provider != ProviderRoute::OpenAiResponses {
+        return body_bytes.clone();
+    }
+    let Value::Object(payload) = request_json else {
+        return body_bytes.clone();
+    };
+    let mut sanitized = payload.clone();
+    sanitized.remove("client_metadata");
+    sanitize_openai_responses_payload(&mut sanitized);
+    if sanitized == *payload {
+        return body_bytes.clone();
+    }
+
+    Bytes::from(
+        serde_json::to_vec(&Value::Object(sanitized)).unwrap_or_else(|_| body_bytes.to_vec()),
+    )
+}
+
+fn sanitize_openai_responses_payload(payload: &mut Map<String, Value>) {
+    let Some(Value::Array(input)) = payload.get_mut("input") else {
+        return;
+    };
+    reorder_assistant_messages_before_function_outputs(input);
+}
+
+fn reorder_assistant_messages_before_function_outputs(input: &mut Vec<Value>) {
+    let mut reordered = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        let Some(call_id) = function_call_id(&input[index]) else {
+            reordered.push(input[index].clone());
+            index += 1;
+            continue;
+        };
+        let Some(output_index) = input
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find_map(|(candidate_index, item)| {
+                is_matching_function_output(item, call_id).then_some(candidate_index)
+            })
+        else {
+            reordered.push(input[index].clone());
+            index += 1;
+            continue;
+        };
+        let between = &input[index + 1..output_index];
+        if between.iter().all(is_message_item) {
+            reordered.extend(between.iter().cloned());
+            reordered.push(input[index].clone());
+            reordered.push(input[output_index].clone());
+            index = output_index + 1;
+        } else {
+            reordered.push(input[index].clone());
+            index += 1;
+        }
+    }
+    *input = reordered;
+}
+
+fn function_call_id(item: &Value) -> Option<&str> {
+    (item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .then(|| item.get("call_id").and_then(Value::as_str))
+        .flatten()
+}
+
+fn is_matching_function_output(item: &Value, call_id: &str) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("function_call_output")
+        && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+}
+
+fn is_message_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
 }
 
 // Builds the [`LlmGatewayStart`] payload from a prepared request. Identifier resolution is shared
@@ -319,6 +402,13 @@ fn build_buffered_func(
             };
             let json = serde_json::from_slice::<Value>(&bytes)
                 .unwrap_or_else(|_| json!({ "body_bytes": bytes.len() }));
+            if !status.is_success() && debug_gateway_enabled() {
+                debug_gateway_dump(
+                    &format!("upstream-response-{}", status.as_u16()),
+                    "body",
+                    &bytes,
+                );
+            }
             *upstream_info.lock().expect("upstream info lock poisoned") =
                 Some((status, response_headers));
             *response_bytes.lock().expect("response bytes lock poisoned") = Some(bytes);
@@ -441,6 +531,29 @@ fn build_streaming_func(
             let response_headers = response_headers(response.headers());
             *upstream_info.lock().expect("upstream info lock poisoned") =
                 Some((status, response_headers));
+            if !status.is_success() && debug_gateway_enabled() {
+                let bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let message = error.to_string();
+                        *upstream_error.lock().expect("upstream error lock poisoned") =
+                            Some(error);
+                        return Err(FlowError::Internal(message));
+                    }
+                };
+                debug_gateway_dump(
+                    &format!("upstream-response-{}", status.as_u16()),
+                    "body",
+                    &bytes,
+                );
+                let message = String::from_utf8_lossy(&bytes).into_owned();
+                let stream: LlmJsonStream = Box::pin(stream! {
+                    yield Err::<Value, FlowError>(FlowError::Internal(format!(
+                        "upstream returned HTTP {status}: {message}"
+                    )));
+                });
+                return Ok(stream);
+            }
             let json_stream = sse_json_stream(response);
             Ok(json_stream)
         })
@@ -539,6 +652,7 @@ async fn forward_upstream_request(
     body_bytes: &Bytes,
     headers: &HeaderMap,
 ) -> Result<reqwest::Response, reqwest::Error> {
+    debug_gateway_dump("upstream-request", "json", body_bytes);
     let mut upstream = http.request(method.clone(), url).body(body_bytes.clone());
     for (name, value) in headers {
         if should_forward_request_header(name) {
@@ -546,6 +660,27 @@ async fn forward_upstream_request(
         }
     }
     upstream.send().await
+}
+
+fn debug_gateway_dump(prefix: &str, extension: &str, bytes: &Bytes) {
+    let Some(dir) = std::env::var_os("NEMO_FLOW_DEBUG_GATEWAY_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let counter = DEBUG_DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{timestamp}-{counter:04}-{prefix}.{extension}"));
+    let _ = std::fs::write(path, bytes);
+}
+
+fn debug_gateway_enabled() -> bool {
+    std::env::var_os("NEMO_FLOW_DEBUG_GATEWAY_DIR").is_some()
 }
 
 // Plain byte passthrough used for streaming routes that lack a typed codec. The managed pipeline
@@ -680,9 +815,10 @@ impl ProviderRoute {
                 config.anthropic_base_url.trim_end_matches('/')
             }
         };
+        let base_has_version = base.ends_with("/v1");
         let path_and_query = match self {
             Self::OpenAiResponses | Self::OpenAiChatCompletions | Self::OpenAiModels
-                if !path_and_query.starts_with("/v1/") =>
+                if !base_has_version && !path_and_query.starts_with("/v1/") =>
             {
                 format!("/v1{path_and_query}")
             }

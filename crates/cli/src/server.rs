@@ -47,7 +47,8 @@ pub(crate) async fn serve_listener(
     config: GatewayConfig,
     shutdown: Option<oneshot::Receiver<()>>,
 ) -> Result<(), CliError> {
-    let app = router(config);
+    let sessions = SessionManager::new(config.clone());
+    let app = router_with_sessions(config, sessions.clone());
     match shutdown {
         Some(receiver) => {
             axum::serve(listener, app)
@@ -60,6 +61,7 @@ pub(crate) async fn serve_listener(
             axum::serve(listener, app).await?;
         }
     }
+    sessions.snapshot_open_sessions().await?;
     Ok(())
 }
 
@@ -67,8 +69,12 @@ pub(crate) async fn serve_listener(
 ///
 /// Hook endpoints normalize agent-specific payloads into session events, while gateway endpoints
 /// proxy model traffic and emit LLM runtime events against the same `SessionManager`.
+#[cfg(test)]
 pub(crate) fn router(config: GatewayConfig) -> Router {
-    let sessions = SessionManager::new(config.clone());
+    router_with_sessions(config.clone(), SessionManager::new(config))
+}
+
+fn router_with_sessions(config: GatewayConfig, sessions: SessionManager) -> Router {
     let http = Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)

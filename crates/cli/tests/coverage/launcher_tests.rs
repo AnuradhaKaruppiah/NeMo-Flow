@@ -196,6 +196,38 @@ fn prepares_codex_config_overrides() {
 }
 
 #[test]
+fn prepares_codex_exec_config_after_exec_subcommand() {
+    let resolved = ResolvedConfig {
+        gateway: GatewayConfig::default(),
+        agents: AgentConfigs::default(),
+    };
+    let prepared = PreparedRun::new(
+        CodingAgent::Codex,
+        vec!["codex".into(), "exec".into(), "--model".into(), "gpt-5.4".into()],
+        "http://127.0.0.1:1234",
+        &resolved,
+        false,
+    )
+    .unwrap();
+
+    let exec_index = prepared
+        .argv
+        .iter()
+        .position(|arg| arg == "exec")
+        .unwrap();
+
+    assert_eq!(prepared.argv[exec_index + 1], "--config");
+    assert!(
+        prepared
+            .argv
+            .iter()
+            .position(|arg| arg == "--model")
+            .unwrap()
+            > exec_index
+    );
+}
+
+#[test]
 fn prepares_claude_dry_run_without_writing_plugin() {
     let resolved = ResolvedConfig {
         gateway: GatewayConfig::default(),

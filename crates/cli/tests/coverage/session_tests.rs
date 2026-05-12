@@ -1864,6 +1864,55 @@ async fn turn_ended_snapshots_atif_without_closing_scope() {
     assert_eq!(trajectory["agent"]["name"], json!("codex"));
 }
 
+#[tokio::test]
+async fn snapshot_open_sessions_writes_atif_without_terminal_hook() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = GatewayConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        openai_base_url: "http://127.0.0.1".into(),
+        anthropic_base_url: "http://127.0.0.1".into(),
+        atif_dir: Some(temp.path().to_path_buf()),
+        openinference_endpoint: None,
+        metadata: None,
+        plugin_config: None,
+    };
+    let manager = SessionManager::new(config);
+    let headers = HeaderMap::new();
+
+    manager
+        .prepare_gateway_call(
+            &headers,
+            LlmGatewayStart {
+                session_id: Some("codex-no-stop".into()),
+                provider: "openai.responses".into(),
+                model_name: Some("gpt-test".into()),
+                subagent_id: None,
+                conversation_id: None,
+                generation_id: None,
+                request_id: None,
+                request: LlmRequest {
+                    headers: serde_json::Map::new(),
+                    content: json!({ "model": "gpt-test" }),
+                },
+                streaming: true,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+    manager.snapshot_open_sessions().await.unwrap();
+
+    let atif_path = temp.path().join("codex-no-stop.atif.json");
+    assert!(
+        atif_path.exists(),
+        "open gateway sessions should be snapshotted during transparent-run shutdown"
+    );
+    let trajectory: Value =
+        serde_json::from_slice(&std::fs::read(&atif_path).unwrap()).unwrap();
+    assert_eq!(trajectory["agent"]["name"], json!("codex"));
+}
+
 // TurnEnded for a session that was never opened (no AgentStarted, no gateway LLM) is a no-op —
 // no observers were ever installed, so there's nothing to flush.
 #[tokio::test]
