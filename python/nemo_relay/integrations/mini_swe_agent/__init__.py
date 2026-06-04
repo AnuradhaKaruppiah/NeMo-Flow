@@ -12,6 +12,7 @@ from nemo_relay.integrations.mini_swe_agent.observer import (
     build_observability_config,
     start_observability,
 )
+from nemo_relay.integrations.mini_swe_agent.trajectory import export_trajectory, replay_trajectory
 
 __all__ = [
     "MiniSweAgentObservabilityConfig",
@@ -20,5 +21,7 @@ __all__ = [
     "artifacts",
     "astart_observability",
     "build_observability_config",
+    "export_trajectory",
+    "replay_trajectory",
     "start_observability",
 ]

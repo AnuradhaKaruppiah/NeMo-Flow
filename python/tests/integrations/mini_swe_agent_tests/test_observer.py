@@ -15,6 +15,7 @@ from nemo_relay.integrations.mini_swe_agent import (
     MiniSweAgentObservabilityConfig,
     NemoRelayMiniSweObserver,
     build_observability_config,
+    replay_trajectory,
 )
 
 
@@ -110,6 +111,91 @@ def test_observer_uses_normalized_action_name(subscribed_events: list[nemo_relay
 
     names = _event_names(subscribed_events)
     assert "bash" in names
+
+
+def test_replay_trajectory_emits_events_from_native_mini_swe_messages(
+    subscribed_events: list[nemo_relay.Event],
+) -> None:
+    trajectory = {
+        "info": {
+            "model_stats": {"instance_cost": 0.0, "api_calls": 1},
+            "exit_status": "Submitted",
+            "submission": "diff --git a/file.py b/file.py",
+        },
+        "messages": [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Fix the bug."},
+            {
+                "role": "assistant",
+                "content": "I will inspect the file.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": json.dumps({"command": "sed -n '1,40p' file.py"}),
+                        },
+                    }
+                ],
+                "extra": {
+                    "actions": [
+                        {
+                            "command": "sed -n '1,40p' file.py",
+                            "tool_call_id": "call-1",
+                        }
+                    ]
+                },
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "<returncode>0</returncode>\n<output>class Example: pass</output>",
+                "extra": {
+                    "raw_output": "class Example: pass",
+                    "returncode": 0,
+                    "exception_info": "",
+                },
+            },
+            {
+                "role": "exit",
+                "content": "diff --git a/file.py b/file.py",
+                "extra": {"exit_status": "Submitted", "submission": "diff --git a/file.py b/file.py"},
+            },
+        ],
+        "trajectory_format": "mini-swe-agent-1.1",
+    }
+
+    observer = NemoRelayMiniSweObserver(instance_id="django__django-13741", model_name="nvidia/test-model")
+    replay_trajectory(trajectory, observer)
+    subscribers.flush()
+
+    names = _event_names(subscribed_events)
+    assert "mini-swe-agent.run" in names
+    assert "mini-swe-agent.step.1" in names
+    assert "mini-swe-agent.model" in names
+    assert "bash" in names
+    assert "mini_swe_agent.submit" in names
+
+    tool_start = next(
+        event
+        for event in subscribed_events
+        if isinstance(event, ScopeEvent) and event.name == "bash" and event.scope_category == "start"
+    )
+    assert tool_start.data["command"] == "sed -n '1,40p' file.py"
+    assert tool_start.data["name"] == "bash"
+    assert tool_start.data["arguments"] == {"command": "sed -n '1,40p' file.py"}
+
+    tool_end = next(
+        event
+        for event in subscribed_events
+        if isinstance(event, ScopeEvent) and event.name == "bash" and event.scope_category == "end"
+    )
+    assert tool_end.data == {
+        "output": "class Example: pass",
+        "returncode": 0,
+        "exception_info": "",
+    }
 
 
 def test_observer_close_finishes_open_handles(subscribed_events: list[nemo_relay.Event]) -> None:
