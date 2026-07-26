@@ -96,9 +96,14 @@ from nemo_relay._native import (
     AtofExporterMode,
     AtofStreamSinkConfig,
     LLMAttributes,
+    LlmCodecIdentity,
     LLMHandle,
     LLMRequest,
     LLMRequestInterceptOutcome,
+    LlmSanitizeRequestCodec,
+    LlmSanitizeRequestContext,
+    LlmSanitizeResponseCodec,
+    LlmSanitizeResponseContext,
     MarkEvent,
     OpenInferenceConfig,
     OpenInferenceSubscriber,
@@ -157,12 +162,13 @@ EventSanitizeGuardrail: TypeAlias = Callable[["Event", EventSanitizeFields], Eve
 #: message. Returning ``None`` allows execution to continue.
 ToolConditionalExecutionGuardrail: TypeAlias = Callable[[str, Json], Optional[str]]
 #: Guardrail callback that sanitizes an ``LLMRequest`` used for emitted events.
-#: The returned request is recorded for observability and does not replace the
-#: caller-visible request value unless the managed LLM API documents otherwise.
-LlmSanitizeRequestGuardrail: TypeAlias = Callable[[LLMRequest], LLMRequest]
-#: Guardrail callback that sanitizes an emitted JSON LLM response payload. The
-#: returned object is recorded on the event; callback exceptions propagate.
-LlmSanitizeResponseGuardrail: TypeAlias = Callable[[JsonObject], JsonObject]
+#: Callbacks receive ``(request, context)``. Returning ``None`` omits the LLM observability
+#: payload and annotation without changing the caller-visible request.
+LlmSanitizeRequestGuardrail: TypeAlias = Callable[[LLMRequest, "LlmSanitizeRequestContext"], Optional[LLMRequest]]
+#: Guardrail callback that sanitizes an emitted JSON LLM response payload.
+#: Callbacks receive ``(response, context)`` and can return ``None`` to omit
+#: observability payload and annotation without changing the caller response.
+LlmSanitizeResponseGuardrail: TypeAlias = Callable[[Json, "LlmSanitizeResponseContext"], Optional[Json]]
 #: Guardrail callback that can block an LLM call by returning a rejection
 #: message. Returning ``None`` allows execution to continue.
 LlmConditionalExecutionGuardrail: TypeAlias = Callable[[LLMRequest], Optional[str]]
@@ -497,6 +503,11 @@ __all__ = [
     "ToolConditionalExecutionGuardrail",
     "LlmSanitizeRequestGuardrail",
     "LlmSanitizeResponseGuardrail",
+    "LlmCodecIdentity",
+    "LlmSanitizeRequestContext",
+    "LlmSanitizeResponseContext",
+    "LlmSanitizeRequestCodec",
+    "LlmSanitizeResponseCodec",
     "LlmConditionalExecutionGuardrail",
     "ToolRequestIntercept",
     "ToolExecutionIntercept",

@@ -15,11 +15,13 @@ use crate::api::event::{
 use crate::api::optimization::{
     LlmOptimizationRecorder, finalize_optimization_summary, scope_llm_optimization_recorder,
 };
+#[cfg(test)]
+use crate::api::runtime::LlmCodecIdentity;
 use crate::api::runtime::NemoRelayContextState;
 use crate::api::runtime::global_context;
 use crate::api::runtime::{
     EventSubscriberFn, LlmCollectorFn, LlmExecutionNextFn, LlmFinalizerFn, LlmJsonStream,
-    LlmStreamExecutionNextFn,
+    LlmSanitizeRequestContext, LlmSanitizeResponseContext, LlmStreamExecutionNextFn,
 };
 use crate::api::runtime::{ScopeStackHandle, current_scope_stack};
 use crate::api::scope::event;
@@ -391,7 +393,7 @@ fn emit_llm_start(
     handle: &LlmHandle,
     request: &LlmRequest,
     annotated_request: Option<Arc<AnnotatedLlmRequest>>,
-    request_codec: Option<&dyn LlmCodec>,
+    request_codec: Option<Arc<dyn LlmCodec>>,
 ) -> Result<()> {
     ensure_runtime_owner()?;
     let subscribers = {
@@ -412,7 +414,7 @@ fn emit_llm_start_with_subscribers(
     handle: &LlmHandle,
     request: &LlmRequest,
     annotated_request: Option<Arc<AnnotatedLlmRequest>>,
-    request_codec: Option<&dyn LlmCodec>,
+    request_codec: Option<Arc<dyn LlmCodec>>,
     subscribers: &[EventSubscriberFn],
 ) -> Result<()> {
     ensure_runtime_owner()?;
@@ -428,36 +430,43 @@ fn emit_llm_start_with_subscribers(
             .map_err(|error| FlowError::Internal(error.to_string()))?;
         state.llm_sanitize_request_entries(&scope_locals)
     };
-    let mut sanitized_request =
-        NemoRelayContextState::llm_sanitize_request_snapshot_chain(request.clone(), &entries);
-    let mut annotated_request = match request_codec {
-        Some(codec)
-            if sanitized_request.headers != request.headers
-                || sanitized_request.content != request.content =>
-        {
-            codec.decode(&sanitized_request).ok().map(Arc::new)
+    let mut sanitized_request = NemoRelayContextState::llm_sanitize_request_snapshot_chain(
+        request.clone(),
+        LlmSanitizeRequestContext::for_request_codec(request_codec.clone()),
+        &entries,
+    );
+    let request_changed = sanitized_request
+        .as_ref()
+        .is_some_and(|sanitized_request| sanitized_request != request);
+    let mut annotated_request = match (sanitized_request.as_ref(), request_codec.as_deref()) {
+        (Some(sanitized_request), Some(codec)) if request_changed => {
+            codec.decode(sanitized_request).ok().map(Arc::new)
         }
-        _ => annotated_request,
+        (Some(_), _) if !request_changed => annotated_request,
+        (None, _) => None,
+        (Some(_), _) => None,
     };
     let scope_stack = handle.captured_scope_stack();
     let agent_is_fresh = {
         let mut scope_guard = scope_stack.write().expect("scope stack lock poisoned");
         scope_guard.take_agent_freshness(handle.parent_uuid)
     };
-    if !agent_is_fresh {
+    if !agent_is_fresh && let Some(sanitized_request) = sanitized_request.as_mut() {
         project_llm_request_to_current_user_turn(
-            &mut sanitized_request,
+            sanitized_request,
             &mut annotated_request,
-            request_codec,
+            request_codec.as_deref(),
         );
     }
-    let input = serde_json::to_value(&sanitized_request).unwrap_or(Json::Null);
+    let input = sanitized_request
+        .as_ref()
+        .and_then(|sanitized_request| serde_json::to_value(sanitized_request).ok());
     let event = {
         let context = global_context();
         let state = context
             .read()
             .map_err(|error| FlowError::Internal(error.to_string()))?;
-        state.build_llm_start_event(handle, Some(input), annotated_request)
+        state.build_llm_start_event(handle, input, annotated_request)
     };
     if let Some(event) = sanitize_event_with_scope_stack(event, scope_stack) {
         NemoRelayContextState::emit_event(&event, subscribers);
@@ -626,9 +635,8 @@ struct LlmCallEndBehavior {
 /// # Parameters
 /// - `handle`: LLM handle to close.
 /// - `response`: Raw provider response associated with the end event.
-/// - `data`: Optional application payload retained for compatibility. The
-///   emitted end event data is the sanitized `response` unless it sanitizes to
-///   JSON null, in which case this payload is used.
+/// - `data`: Optional application payload retained for compatibility. When the
+///   raw `response` is JSON null, this payload is sanitized in its place.
 /// - `metadata`: Optional JSON metadata recorded on the end event.
 /// - `annotated_response`: Optional normalized response annotation produced by
 ///   a response codec. When omitted and `response_codec` is supplied, the
@@ -693,20 +701,36 @@ fn llm_call_end_with_behavior(
         let entries = state.llm_sanitize_response_entries(&scope_locals);
         (entries, subscribers)
     };
-    let sanitized_response =
-        NemoRelayContextState::llm_sanitize_response_snapshot_chain(response, &entries);
-    let data = if sanitized_response.is_null() {
-        data
+    let response_was_null_without_fallback = response.is_null() && data.is_none();
+    let response = if response.is_null() {
+        data.unwrap_or(response)
     } else {
-        Some(sanitized_response)
+        response
     };
-    let (mut annotated_response, decode_error) = resolve_llm_end_annotation(
-        annotated_response,
-        response_codec,
-        data.as_ref(),
-        &behavior,
-        &handle.name,
+    let sanitized_response = NemoRelayContextState::llm_sanitize_response_snapshot_chain(
+        response.clone(),
+        LlmSanitizeResponseContext::for_response_codec(response_codec.clone()),
+        &entries,
     );
+    let response_changed = sanitized_response
+        .as_ref()
+        .is_some_and(|sanitized_response| sanitized_response != &response);
+    let data = match sanitized_response {
+        Some(response) if response_was_null_without_fallback && response.is_null() => None,
+        response => response,
+    };
+    let annotation_omitted = data.as_ref().is_none_or(Json::is_null);
+    let (mut annotated_response, decode_error) = if annotation_omitted {
+        (None, None)
+    } else {
+        resolve_llm_end_annotation(
+            (!response_changed).then_some(annotated_response).flatten(),
+            response_codec,
+            data.as_ref(),
+            &behavior,
+            &handle.name,
+        )
+    };
     handle.optimization_recorder.close_for_finalization(None);
     emit_optimization_marks(handle, &subscribers);
     let pricing = crate::codec::response::active_pricing_resolver();
@@ -716,7 +740,8 @@ fn llm_call_end_with_behavior(
         handle.model_name.as_deref(),
         &pricing,
     );
-    if annotated_response.is_none()
+    if !annotation_omitted
+        && annotated_response.is_none()
         && let Some(summary) = summary
     {
         annotated_response = Some(AnnotatedLlmResponse {
@@ -753,6 +778,22 @@ fn llm_call_end_with_behavior(
     }
 }
 
+#[cfg(test)]
+fn sanitize_context_for_request_codec(codec: Option<&dyn LlmCodec>) -> LlmSanitizeRequestContext {
+    LlmSanitizeRequestContext::with_identity(
+        codec.map_or(LlmCodecIdentity::None, LlmCodec::codec_identity),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn sanitize_context_for_response_codec(
+    codec: Option<&dyn LlmResponseCodec>,
+) -> LlmSanitizeResponseContext {
+    LlmSanitizeResponseContext::with_identity(
+        codec.map_or(LlmCodecIdentity::None, LlmResponseCodec::codec_identity),
+    )
+}
+
 fn resolve_llm_end_annotation(
     annotated_response: Option<Arc<AnnotatedLlmResponse>>,
     response_codec: Option<Arc<dyn LlmResponseCodec>>,
@@ -780,39 +821,63 @@ fn resolve_llm_end_annotation(
 fn emit_llm_end_without_output(
     handle: &LlmHandle,
     metadata: Option<Json>,
+    response_codec: Option<Arc<dyn LlmResponseCodec>>,
     lifecycle_subscribers: Option<&[EventSubscriberFn]>,
 ) -> Result<()> {
     ensure_runtime_owner()?;
-    let subscribers = {
+    let (entries, subscribers) = {
         let scope_stack = handle.captured_scope_stack();
         let scope_guard = scope_stack.read().expect("scope stack lock poisoned");
+        let scope_locals = scope_guard.collect_scope_local_registries(|registries| {
+            &registries.llm_sanitize_response_guardrails
+        });
         let scope_subscribers = scope_guard.collect_scope_local_subscribers();
-        match lifecycle_subscribers {
+        let subscribers = match lifecycle_subscribers {
             Some(subscribers) => subscribers.to_vec(),
             None => snapshot_event_subscribers(scope_subscribers)?,
-        }
+        };
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?;
+        let entries = state.llm_sanitize_response_entries(&scope_locals);
+        (entries, subscribers)
     };
+    let had_fallback_data = handle.data.is_some();
+    let data = handle.data.clone().and_then(|data| {
+        NemoRelayContextState::llm_sanitize_response_snapshot_chain(
+            data,
+            LlmSanitizeResponseContext::for_response_codec(response_codec),
+            &entries,
+        )
+    });
+    let annotation_omitted =
+        (had_fallback_data && data.is_none()) || data.as_ref().is_some_and(Json::is_null);
     handle.optimization_recorder.close_for_finalization(None);
     emit_optimization_marks(handle, &subscribers);
     let pricing = crate::codec::response::active_pricing_resolver();
-    let annotated_response = finalize_optimization_summary(
-        &handle.optimization_recorder,
-        None,
-        handle.model_name.as_deref(),
-        &pricing,
-    )
-    .map(|summary| {
-        Arc::new(AnnotatedLlmResponse {
-            optimization_summary: Some(summary),
-            ..AnnotatedLlmResponse::default()
+    let annotated_response = (!annotation_omitted)
+        .then(|| {
+            finalize_optimization_summary(
+                &handle.optimization_recorder,
+                None,
+                handle.model_name.as_deref(),
+                &pricing,
+            )
         })
-    });
+        .flatten()
+        .map(|summary| {
+            Arc::new(AnnotatedLlmResponse {
+                optimization_summary: Some(summary),
+                ..AnnotatedLlmResponse::default()
+            })
+        });
     let event = {
         let context = global_context();
         let state = context
             .read()
             .map_err(|error| FlowError::Internal(error.to_string()))?;
-        state.end_llm_handle(handle, handle.data.clone(), metadata, annotated_response)
+        state.end_llm_handle(handle, data, metadata, annotated_response)
     };
     if let Some(event) = sanitize_event_with_scope_stack(event, handle.captured_scope_stack()) {
         NemoRelayContextState::emit_event(&event, &subscribers);
@@ -950,7 +1015,7 @@ pub async fn llm_call_execute(params: LlmCallExecuteParams) -> Result<Json> {
         &handle,
         &intercepted_request,
         annotated_request.clone(),
-        request_codec.as_deref(),
+        request_codec.clone(),
         &lifecycle_subscribers,
     )?;
     emit_pending_request_marks(&handle, pending_marks, &lifecycle_subscribers)?;
@@ -999,8 +1064,12 @@ pub async fn llm_call_execute(params: LlmCallExecuteParams) -> Result<Json> {
         Err(error) => {
             let end_metadata =
                 metadata_with_otel_status(metadata, "ERROR", Some(error.to_string()));
-            let _ =
-                emit_llm_end_without_output(&handle, end_metadata, Some(&lifecycle_subscribers));
+            let _ = emit_llm_end_without_output(
+                &handle,
+                end_metadata,
+                response_codec,
+                Some(&lifecycle_subscribers),
+            );
             Err(error)
         }
     }
@@ -1136,7 +1205,7 @@ pub async fn llm_stream_call_execute(params: LlmStreamCallExecuteParams) -> Resu
         &handle,
         &intercepted_request,
         annotated_request,
-        request_codec.as_deref(),
+        request_codec.clone(),
         &lifecycle_subscribers,
     )?;
     emit_pending_request_marks(&handle, pending_marks, &lifecycle_subscribers)?;
@@ -1180,8 +1249,12 @@ pub async fn llm_stream_call_execute(params: LlmStreamCallExecuteParams) -> Resu
         Err(error) => {
             let end_metadata =
                 metadata_with_otel_status(metadata, "ERROR", Some(error.to_string()));
-            let _ =
-                emit_llm_end_without_output(&handle, end_metadata, Some(&lifecycle_subscribers));
+            let _ = emit_llm_end_without_output(
+                &handle,
+                end_metadata,
+                response_codec,
+                Some(&lifecycle_subscribers),
+            );
             Err(error)
         }
     }

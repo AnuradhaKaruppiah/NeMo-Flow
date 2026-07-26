@@ -39,8 +39,8 @@ class _EventSanitizeFields(TypedDict):
 
 _ToolSanitizeGuardrail: TypeAlias = Callable[[str, _Json], _Json]
 _ToolConditionalExecutionGuardrail: TypeAlias = Callable[[str, _Json], Optional[str]]
-_LlmSanitizeRequestGuardrail: TypeAlias = Callable[["LLMRequest"], "LLMRequest"]
-_LlmSanitizeResponseGuardrail: TypeAlias = Callable[[_JsonObject], _JsonObject]
+_LlmSanitizeRequestGuardrail: TypeAlias = Callable[["LLMRequest", "LlmSanitizeRequestContext"], Optional["LLMRequest"]]
+_LlmSanitizeResponseGuardrail: TypeAlias = Callable[[_Json, "LlmSanitizeResponseContext"], Optional[_Json]]
 _EventSanitizeGuardrail: TypeAlias = Callable[[ScopeEvent | MarkEvent, _EventSanitizeFields], _EventSanitizeFields]
 _LlmConditionalExecutionGuardrail: TypeAlias = Callable[["LLMRequest"], Optional[str]]
 _ToolRequestIntercept: TypeAlias = Callable[[str, _Json], _Json]
@@ -60,6 +60,35 @@ _LlmStreamExecutionIntercept: TypeAlias = Callable[
     ["LLMRequest", Callable[["LLMRequest"], Awaitable[AsyncIterator[_Json]]]],
     AsyncIterator[_Json] | Awaitable[AsyncIterator[_Json]],
 ]
+
+class LlmCodecIdentity:
+    """Structured identity of the active managed LLM codec."""
+
+    @property
+    def kind(self) -> Literal["none", "builtin", "runtime", "opaque"]: ...
+    @property
+    def id(self) -> str | None: ...
+
+class LlmSanitizeRequestContext:
+    """Per-call context passed to an LLM request sanitizer callback."""
+
+    @property
+    def codec(self) -> LlmCodecIdentity: ...
+    def resolve_codec(self) -> LlmSanitizeRequestCodec | None: ...
+
+class LlmSanitizeResponseContext:
+    """Per-call context passed to an LLM response sanitizer callback."""
+
+    @property
+    def codec(self) -> LlmCodecIdentity: ...
+    def resolve_codec(self) -> LlmSanitizeResponseCodec | None: ...
+
+class LlmSanitizeRequestCodec:
+    def decode(self, request: LLMRequest) -> AnnotatedLLMRequest: ...
+    def encode(self, annotated: AnnotatedLLMRequest, original: LLMRequest) -> LLMRequest: ...
+
+class LlmSanitizeResponseCodec:
+    def decode_response(self, response: _Json) -> AnnotatedLLMResponse: ...
 
 class ScopeAttributes:
     """Bitflags describing scope properties.
