@@ -22,7 +22,7 @@ use render::*;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, future::join_all};
 use nemo_relay::api::event::{BaseEvent, Event, MarkEvent};
 use nemo_relay::codec::model_pricing::{PricingCatalog, PricingConfig, PricingSourceConfig};
 use nemo_relay::observability::plugin_component::OBSERVABILITY_PLUGIN_KIND;
@@ -602,11 +602,7 @@ async fn collect_observability_component_checks(checks: &mut Vec<Check>, config:
     if let Some(check) = observability_file_exporter_check(config, "atif") {
         checks.push(check);
     }
-    for section in ["opentelemetry", "openinference"] {
-        if let Some(check) = observability_http_exporter_check(config, section).await {
-            checks.push(check);
-        }
-    }
+    checks.extend(observability_http_exporter_checks(config).await);
     if section_enabled(config, "atof") && !atof_stream_sinks(config).is_empty() {
         if atof_streaming_supported() {
             checks.extend(observability_atof_stream_checks(config).await);
@@ -678,23 +674,53 @@ fn observability_file_exporter_check(config: &Value, section: &str) -> Option<Ch
     })
 }
 
-async fn observability_http_exporter_check(config: &Value, section: &str) -> Option<Check> {
-    if !section_enabled(config, section) {
-        return None;
+async fn observability_http_exporter_checks(config: &Value) -> Vec<Check> {
+    if !section_enabled(config, "opentelemetry") {
+        return Vec::new();
     }
-    let label = if section == "opentelemetry" {
-        "OpenTelemetry endpoint"
-    } else {
-        "OpenInference endpoint"
+    let Some(endpoints) = config
+        .get("opentelemetry")
+        .and_then(|section| section.get("endpoints"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
     };
-    Some(match section_endpoint(config, section) {
-        Some(endpoint) => probe_http_named(label, &endpoint).await,
-        None => Check {
-            name: label,
-            status: Status::Info,
-            details: "enabled; using exporter default endpoint".into(),
-        },
-    })
+    join_all(
+        endpoints
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| async move {
+                let endpoint_type = endpoint
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let label = "OpenTelemetry endpoint";
+                let transport = endpoint
+                    .get("transport")
+                    .and_then(Value::as_str)
+                    .unwrap_or("http_binary");
+                match endpoint.get("endpoint").and_then(Value::as_str) {
+                    Some(url) => {
+                        let mut check = if transport == "grpc" {
+                            probe_tcp_named(label, url).await
+                        } else {
+                            probe_http_named(label, url).await
+                        };
+                        check.details =
+                            format!("endpoints[{index}] ({endpoint_type}): {}", check.details);
+                        check
+                    }
+                    None => Check {
+                        name: label,
+                        status: Status::Fail,
+                        details: format!(
+                            "endpoints[{index}] ({endpoint_type}): endpoint is required"
+                        ),
+                    },
+                }
+            }),
+    )
+    .await
 }
 
 fn observability_component_config(plugin_value: &Value) -> Option<&Value> {
@@ -809,14 +835,6 @@ fn section_output_directory(config: &Value, section: &str) -> Option<PathBuf> {
         .and_then(|section| section.get("output_directory"))
         .and_then(Value::as_str)
         .map(PathBuf::from)
-}
-
-fn section_endpoint(config: &Value, section: &str) -> Option<String> {
-    config
-        .get(section)
-        .and_then(|section| section.get("endpoint"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
 }
 
 fn atof_stream_sinks(config: &Value) -> Vec<(usize, &Value)> {
