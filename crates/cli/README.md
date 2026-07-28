@@ -137,11 +137,23 @@ Project config lives at `./.nemo-relay/config.toml`; user config lives at
 The project layer overrides system config, and the user layer overrides the
 project layer.
 
-General options are configured through the top-level config. Edit the config with:
+Set up agent entries in the top-level config with:
 
 ```bash
 nemo-relay config
 ```
+
+Edit gateway limits, provider upstreams, and operational logging with the
+structured user-config editor:
+
+```bash
+nemo-relay config edit
+```
+
+Use `--project` for the nearest project `config.toml`, or `--global` for
+`/etc/nemo-relay/config.toml`. Global saves are system-readable (`0644` on
+Unix) and reject authorization headers; use the corresponding environment
+variables or a user config for credentials.
 
 Observability exporters are configured through the plugin config. Edit the user
 plugin config with:
@@ -158,7 +170,10 @@ Other dynamic plugins use a raw JSON object editor.
 The canonical plugin file is `plugins.toml`; user config lives at
 `~/.config/nemo-relay/plugins.toml` or
 `$XDG_CONFIG_HOME/nemo-relay/plugins.toml`. Project config lives at
-`.nemo-relay/plugins.toml`.
+`.nemo-relay/plugins.toml`. Use `nemo-relay plugins edit --global` to edit
+`/etc/nemo-relay/plugins.toml`; it is system-readable (`0644` on Unix), so do
+not store credentials there. The editor rejects schema-declared secret values
+in global plugin configuration.
 
 Minimal ATIF example:
 
