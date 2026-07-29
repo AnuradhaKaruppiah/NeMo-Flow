@@ -62,7 +62,25 @@ The CLI provides these capabilities:
 
 ## Installation Options
 
-Cargo:
+Install the prebuilt CLI from PyPI:
+
+```bash
+pip install nemo-relay-cli-bin
+```
+
+Install the prebuilt CLI from npm:
+
+```bash
+npm install --global nemo-relay-cli-bin
+```
+
+Install the Python API and matching CLI with the optional extra:
+
+```bash
+pip install "nemo-relay[cli]"
+```
+
+Build and install the CLI from crates.io with Cargo:
 
 ```bash
 cargo install nemo-relay-cli
