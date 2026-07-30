@@ -4,6 +4,7 @@
 //! Advanced runtime state, callbacks, and scope-stack helpers.
 
 pub mod callbacks;
+mod continuation_context;
 pub mod global;
 pub mod scope_stack;
 pub mod state;
@@ -17,6 +18,10 @@ pub use callbacks::{
     LlmStreamExecutionNextFn, LlmStreamInner, ToolConditionalFn, ToolExecutionFn,
     ToolExecutionNextFn, ToolInterceptFn, ToolSanitizeFn,
 };
+#[doc(hidden)]
+pub use continuation_context::MiddlewareContinuationContext;
+#[cfg(test)]
+pub(crate) use continuation_context::MiddlewareContinuationLease;
 pub use global::global_context;
 pub use scope_stack::{
     PropagationContext, ScopeStack, ScopeStackHandle, TASK_SCOPE_STACK, ThreadScopeStackBinding,
