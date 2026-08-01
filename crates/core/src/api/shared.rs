@@ -214,6 +214,16 @@ pub(crate) fn metadata_with_otel_status(
     metadata
 }
 
+pub(crate) fn metadata_with_otel_error(metadata: Option<Json>, error: &FlowError) -> Option<Json> {
+    let mut metadata = metadata_with_otel_status(metadata, "ERROR", Some(error.to_string()));
+    if let Some(Json::Object(metadata)) = metadata.as_mut() {
+        metadata
+            .entry("error.type".to_string())
+            .or_insert_with(|| Json::String(error.otel_error_type().to_string()));
+    }
+    metadata
+}
+
 pub(crate) type InterceptedLlmRequest = (
     LlmRequest,
     Option<Arc<AnnotatedLlmRequest>>,
