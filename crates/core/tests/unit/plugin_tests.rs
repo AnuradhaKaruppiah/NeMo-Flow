@@ -764,6 +764,7 @@ fn test_config_report_has_errors() {
             field: None,
             message: "boom".into(),
         }],
+        ..ConfigReport::default()
     };
     assert!(report.has_errors());
 }
@@ -1048,7 +1049,13 @@ fn test_plugin_helper_defaults_and_policy_diagnostics() {
     assert_eq!(diagnostics[0].component.as_deref(), Some("warn.plugin"));
     assert_eq!(diagnostics[0].field.as_deref(), Some("field"));
     assert_eq!(diagnostics[1].level, DiagnosticLevel::Error);
-    assert_eq!(join_error_messages(&ConfigReport { diagnostics }), "error");
+    assert_eq!(
+        join_error_messages(&ConfigReport {
+            diagnostics,
+            ..ConfigReport::default()
+        }),
+        "error"
+    );
 
     reset_global();
 }
@@ -1494,6 +1501,50 @@ fn test_checked_teardown_reports_unremoved_registrations() {
     let error = outcome.result.unwrap_err().to_string();
     assert!(error.contains("stale-callback"), "{error}");
     assert!(error.contains("deregistration refused"), "{error}");
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_teardown_runtime_diagnostics_remain_in_the_plugin_report() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    store_active_plugin_configuration(
+        PluginConfig::default(),
+        ConfigReport::default(),
+        vec![PluginRegistration::new(
+            "fixture",
+            "atif-shutdown",
+            Box::new(|| {
+                record_active_plugin_runtime_diagnostic(RuntimeDiagnostic {
+                    code: "atif.remote_delivery_failed".into(),
+                    component: "observability".into(),
+                    field: Some("storage[0]".into()),
+                    message: "HTTP 500".into(),
+                    session_id: Some("session-123".into()),
+                    count: 1,
+                });
+                Err(PluginError::RegistrationFailed(format!(
+                    "{}: atif.remote_delivery_failed (1)",
+                    crate::observability::plugin_component::ATIF_RUNTIME_DELIVERY_FAILURE_MARKER
+                )))
+            }),
+        )],
+    )
+    .unwrap();
+
+    let outcome = clear_plugin_configuration_inner();
+    assert!(outcome.callbacks_cleared);
+    assert!(outcome.result.is_err());
+    let report = active_plugin_report().expect("failed teardown should retain its report");
+    assert_eq!(report.runtime_diagnostics.len(), 1);
+    let diagnostic = &report.runtime_diagnostics[0];
+    assert_eq!(diagnostic.code, "atif.remote_delivery_failed");
+    assert_eq!(diagnostic.field.as_deref(), Some("storage[0]"));
+    assert_eq!(diagnostic.message, "HTTP 500");
+    assert_eq!(diagnostic.session_id.as_deref(), Some("session-123"));
+
+    clear_plugin_configuration_inner();
     assert!(active_plugin_report().is_none());
     reset_global();
 }
