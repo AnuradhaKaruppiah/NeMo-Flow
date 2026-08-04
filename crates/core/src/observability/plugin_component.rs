@@ -60,7 +60,8 @@ use crate::observability::{
     validate_attribute_mappings,
 };
 use crate::plugin::{
-    ConfigDiagnostic, ConfigPolicy, DiagnosticLevel, Plugin, PluginComponentSpec, PluginError,
+    ATIF_RUNTIME_DELIVERY_FAILURE_MARKER, ConfigDiagnostic, ConfigPolicy, DiagnosticLevel,
+    OTEL_RUNTIME_DELIVERY_FAILURE_MARKER, Plugin, PluginComponentSpec, PluginError,
     PluginRegistration, PluginRegistrationContext, Result as PluginResult, UnsupportedBehavior,
     apply_global_config_policy, deregister_plugin, register_builtin_plugin,
 };
@@ -68,9 +69,6 @@ use crate::plugin::{RuntimeDiagnostic, record_active_plugin_runtime_diagnostic};
 
 /// The plugin kind registered by the core crate.
 pub const OBSERVABILITY_PLUGIN_KIND: &str = "observability";
-/// Identifies teardown errors caused by recoverable ATIF delivery failures.
-pub(crate) const ATIF_RUNTIME_DELIVERY_FAILURE_MARKER: &str = "ATIF runtime delivery failures";
-
 /// Top-level observability component wrapper.
 ///
 /// Use this wrapper when constructing a [`PluginComponentSpec`] from Rust
@@ -1036,14 +1034,14 @@ fn build_opentelemetry_subscribers(
     let mut subscribers = Vec::with_capacity(endpoints.len());
     for (index, endpoint) in endpoints.into_iter().enumerate() {
         let subscriber = build_otel_config(index, endpoint).and_then(|config| {
-            OpenTelemetrySubscriber::new(config)
+            OpenTelemetrySubscriber::new_for_plugin(config, index)
                 .map(Arc::new)
                 .map_err(observability_registration_error)
         });
         match subscriber {
             Ok(subscriber) => subscribers.push(subscriber),
             Err(error) => {
-                if let Some(_rollback_error) = shutdown_opentelemetry_providers(&subscribers) {
+                if !shutdown_opentelemetry_providers(&subscribers).is_empty() {
                     log::warn!(
                         target: "nemo_relay.plugin",
                         event = "plugin_resource_rollback_failed",
@@ -1063,28 +1061,43 @@ fn build_opentelemetry_subscribers(
 fn shutdown_opentelemetry_subscribers(
     subscribers: &[Arc<OpenTelemetrySubscriber>],
 ) -> Option<PluginError> {
-    let mut first_error = flush_subscribers().err().map(|error| {
-        observability_registration_error(crate::observability::otel::OpenTelemetryError::Core(
-            error,
-        ))
-    });
-    let provider_error = shutdown_opentelemetry_providers(subscribers);
-    if first_error.is_none() {
-        first_error = provider_error;
+    let mut errors = Vec::new();
+    if let Err(error) = flush_subscribers() {
+        errors.push(crate::observability::otel::OpenTelemetryError::Core(error));
     }
-    first_error
+    errors.extend(shutdown_opentelemetry_providers(subscribers));
+    if errors.is_empty() {
+        return None;
+    }
+
+    let all_delivery_failures = errors.iter().all(|error| {
+        error
+            .to_string()
+            .contains(OTEL_RUNTIME_DELIVERY_FAILURE_MARKER)
+    });
+    let summary = errors
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let message = if all_delivery_failures {
+        format!("{OTEL_RUNTIME_DELIVERY_FAILURE_MARKER}: {summary}")
+    } else {
+        format!("OpenTelemetry shutdown failures: {summary}")
+    };
+    Some(PluginError::RegistrationFailed(message))
 }
 
 fn shutdown_opentelemetry_providers(
     subscribers: &[Arc<OpenTelemetrySubscriber>],
-) -> Option<PluginError> {
-    let mut first_error = None;
+) -> Vec<crate::observability::otel::OpenTelemetryError> {
+    let mut errors = Vec::new();
     for subscriber in subscribers {
         if let Err(error) = subscriber.shutdown_provider() {
-            first_error.get_or_insert_with(|| observability_registration_error(error));
+            errors.push(error);
         }
     }
-    first_error
+    errors
 }
 
 struct AtifDispatcher {
