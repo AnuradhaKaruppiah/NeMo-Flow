@@ -2447,6 +2447,35 @@ fn atif_metadata_template_values_must_be_safe_path_fragments() {
             .prepare_destination("session-1", Some(&non_string))
             .is_err()
     );
+    let dispatcher_with_fallback = AtifDispatcher::new(AtifSectionConfig {
+        filename_template: "{metadata.artifact_path:-unassigned}/trajectory-{session_id}.json"
+            .to_string(),
+        ..AtifSectionConfig::default()
+    });
+    let error = dispatcher_with_fallback
+        .prepare_destination("session-1", Some(&non_string))
+        .unwrap_err();
+    assert!(error.contains("resolved to a non-string value"), "{error}");
+    let nested_non_string = json!({"artifact": 123});
+    let nested_dispatcher = AtifDispatcher::new(AtifSectionConfig {
+        filename_template: "{metadata.artifact.path:-unassigned}/trajectory-{session_id}.json"
+            .to_string(),
+        ..AtifSectionConfig::default()
+    });
+    let error = nested_dispatcher
+        .prepare_destination("session-1", Some(&nested_non_string))
+        .unwrap_err();
+    assert!(error.contains("traversed a non-object value"), "{error}");
+    let nested_null = json!({"artifact": null});
+    let destination = nested_dispatcher
+        .prepare_destination("session-1", Some(&nested_null))
+        .unwrap();
+    assert_eq!(destination.0, "unassigned/trajectory-session-1.json");
+    let nested_string = json!({"artifact": {"path": "tenant-a/team_1"}});
+    let destination = nested_dispatcher
+        .prepare_destination("session-1", Some(&nested_string))
+        .unwrap();
+    assert_eq!(destination.0, "tenant-a/team_1/trajectory-session-1.json");
 
     for template in [
         "/tmp/trajectory-{session_id}.json",
@@ -2732,7 +2761,140 @@ fn opentelemetry_endpoints_fan_out_to_heterogeneous_and_repeated_types() {
 }
 
 #[test]
-fn opentelemetry_rejects_different_projection_types_at_the_same_effective_destination() {
+fn opentelemetry_rejects_canonical_equivalent_destinations() {
+    for (first, second) in [
+        (
+            "http://collector.example/v1/traces",
+            "http://collector.example:80/v1/traces",
+        ),
+        (
+            "https://collector.example/v1/traces",
+            "https://collector.example:443/v1/traces",
+        ),
+        (
+            "HTTP://COLLECTOR.EXAMPLE/v1/traces",
+            "http://collector.example/v1/traces",
+        ),
+        (
+            "http://collector.example//v1///traces",
+            "http://collector.example/v1/traces/",
+        ),
+        ("http://localhost/v1/traces", "http://LOCALHOST/v1/traces"),
+        ("http://localhost/v1/traces", "http://localhost./v1/traces"),
+        (
+            "http://localhost/v1/traces",
+            "http://agent.localhost/v1/traces",
+        ),
+        ("http://localhost/v1/traces", "http://127.0.0.2/v1/traces"),
+        ("http://localhost/v1/traces", "http://127.1/v1/traces"),
+        ("http://localhost/v1/traces", "http://[::1]/v1/traces"),
+    ] {
+        let config = plugin_config(json!({
+            "opentelemetry": {
+                "enabled": true,
+                "endpoints": [
+                    {"type": "full", "endpoint": first},
+                    {"type": "gen_ai", "endpoint": second}
+                ]
+            }
+        }));
+
+        let report = validate_plugin_config(&config);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "observability.unsafe_otel_destination_collision"
+            }),
+            "expected equivalent destinations {first:?} and {second:?} to collide"
+        );
+    }
+
+    let grpc = plugin_config(json!({
+        "opentelemetry": {
+            "enabled": true,
+            "endpoints": [
+                {
+                    "type": "full",
+                    "transport": "grpc",
+                    "endpoint": "https://collector.example"
+                },
+                {
+                    "type": "gen_ai",
+                    "transport": "grpc",
+                    "endpoint": "https://collector.example:443/"
+                }
+            ]
+        }
+    }));
+    assert!(validate_plugin_config(&grpc).has_errors());
+}
+
+#[test]
+fn opentelemetry_allows_distinct_canonical_destinations() {
+    for (first, second) in [
+        (
+            "http://collector.example:4318/v1/traces",
+            "http://collector.example:4319/v1/traces",
+        ),
+        (
+            "http://collector.example:443/v1/traces",
+            "https://collector.example/v1/traces",
+        ),
+        (
+            "http://collector.example/v1/traces",
+            "http://collector.example/custom/traces",
+        ),
+        (
+            "http://collector.example/v1/traces",
+            "http://collector.example/v1%2Ftraces",
+        ),
+        (
+            "http://collector.example/v1/traces?tenant=one",
+            "http://collector.example/v1/traces?tenant=two",
+        ),
+        (
+            "http://localhost.example/v1/traces",
+            "http://localhost/v1/traces",
+        ),
+        ("http://[::2]/v1/traces", "http://localhost/v1/traces"),
+    ] {
+        let config = plugin_config(json!({
+            "opentelemetry": {
+                "enabled": true,
+                "endpoints": [
+                    {"type": "full", "endpoint": first},
+                    {"type": "gen_ai", "endpoint": second}
+                ]
+            }
+        }));
+
+        assert!(
+            !validate_plugin_config(&config).has_errors(),
+            "expected distinct destinations {first:?} and {second:?} to remain valid"
+        );
+    }
+
+    let different_transports = plugin_config(json!({
+        "opentelemetry": {
+            "enabled": true,
+            "endpoints": [
+                {
+                    "type": "full",
+                    "transport": "http_binary",
+                    "endpoint": "http://collector.example/v1/traces"
+                },
+                {
+                    "type": "gen_ai",
+                    "transport": "grpc",
+                    "endpoint": "http://collector.example/v1/traces"
+                }
+            ]
+        }
+    }));
+    assert!(!validate_plugin_config(&different_transports).has_errors());
+}
+
+#[test]
+fn opentelemetry_rejects_canonical_collision_during_validation_and_activation() {
     let _guard = crate::observability::test_mutex().lock().unwrap();
     reset_runtime();
     let config = plugin_config(json!({
@@ -2740,8 +2902,8 @@ fn opentelemetry_rejects_different_projection_types_at_the_same_effective_destin
         "opentelemetry": {
             "enabled": true,
             "endpoints": [
-                {"type": "full", "endpoint": " http://127.0.0.1:4318 "},
-                {"type": "gen_ai", "endpoint": "http://127.0.0.1:4318/v1/traces"}
+                {"type": "full", "endpoint": " http://LOCALHOST:80//v1///traces/ "},
+                {"type": "gen_ai", "endpoint": "http://127.1/v1/traces"}
             ]
         }
     }));
@@ -2755,7 +2917,7 @@ fn opentelemetry_rejects_different_projection_types_at_the_same_effective_destin
             && diagnostic.message.contains("endpoints[1] (gen_ai)")
             && diagnostic
                 .message
-                .contains("http://127.0.0.1:4318/v1/traces")
+                .contains("http://<loopback>:80/v1/traces")
     }));
     assert!(futures::executor::block_on(initialize_plugins_exact(config)).is_err());
     assert!(
@@ -2773,8 +2935,8 @@ fn opentelemetry_allows_repeated_projection_types_at_the_same_destination() {
         "opentelemetry": {
             "enabled": true,
             "endpoints": [
-                {"type": "full", "endpoint": "http://127.0.0.1:4318/v1/traces"},
-                {"type": "full", "endpoint": "http://127.0.0.1:4318/v1/traces"}
+                {"type": "full", "endpoint": "http://LOCALHOST:80//v1///traces/"},
+                {"type": "full", "endpoint": "http://127.1/v1/traces"}
             ]
         }
     }));
@@ -2904,9 +3066,13 @@ fn opentelemetry_shutdown_helper_retains_every_endpoint_failure() {
     })
     .collect::<Vec<_>>();
 
-    let error = shutdown_opentelemetry_subscribers(&subscribers)
-        .expect("mixed endpoint shutdown failures should be reported")
-        .to_string();
+    let OpenTelemetryShutdownFailure::Other(error) =
+        shutdown_opentelemetry_subscribers(&subscribers)
+            .expect("mixed endpoint shutdown failures should be reported")
+    else {
+        panic!("mixed endpoint shutdown failures must retain the registration failure outcome");
+    };
+    let error = error.to_string();
 
     assert_eq!(dropped_calls.load(Ordering::SeqCst), 1);
     assert_eq!(timeout_calls.load(Ordering::SeqCst), 1);
