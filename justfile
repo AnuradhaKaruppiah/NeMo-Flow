@@ -59,7 +59,11 @@ PY
 uv_python_executable() {
     (
         cd "$NEMO_RELAY_REPO_ROOT"
-        uv python find
+        if [[ -n "${UV_PYTHON:-}" ]]; then
+            uv python find "$UV_PYTHON"
+        else
+            uv python find
+        fi
     )
 }
 
@@ -922,7 +926,7 @@ rust_source_coverage_supported() {
     local host
     host="$(rustc -vV | sed -n 's/^host: //p')"
     case "$host" in
-        aarch64-pc-windows-msvc)
+        aarch64-pc-windows-msvc|*-unknown-linux-musl)
             return 1
             ;;
         *)
@@ -1216,7 +1220,7 @@ test-rust:
             prepare_llvm_cov_workspace
         fi
         prepare_test_plugin_fixtures
-        cargo nextest run --workspace --profile ci --no-fail-fast
+        cargo nextest run --locked --workspace --profile ci --no-fail-fast
         cp "$NEMO_RELAY_REPO_ROOT/target/nextest/ci/rust_junit_report.xml" "$junit_out"
         if rust_source_coverage_supported; then
             cargo llvm-cov report \
