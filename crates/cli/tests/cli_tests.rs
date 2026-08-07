@@ -86,6 +86,13 @@ fn read_jsonl_records(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn read_jsonl_event(path: &Path, event: &str) -> serde_json::Value {
+    read_jsonl_records(path)
+        .into_iter()
+        .find(|record| record["event"] == event)
+        .unwrap_or_else(|| panic!("missing {event} record in {}", path.display()))
+}
+
 fn write_dynamic_plugin_manifest(dir: &std::path::Path, plugin_id: &str) {
     write_dynamic_plugin_manifest_with_options(dir, plugin_id, &["plugin_worker"], None);
 }
@@ -3674,6 +3681,196 @@ command = "codex exec"
         .expect("dry-run output should include argv");
     assert!(argv.starts_with("argv = codex "), "{stdout}");
     assert!(argv.ends_with(" exec"), "{stdout}");
+}
+
+#[test]
+fn invocation_diagnostic_cli_warns_during_dry_run_without_rewriting_the_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let (logging_config, log_path) = write_jsonl_logging_config(temp.path());
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"
+[upstream]
+openai_base_url = "http://127.0.0.1:1"
+anthropic_base_url = "http://127.0.0.1:1"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(gateway_bin())
+        .current_dir(temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("xdg"))
+        .env("HOME", temp.path())
+        .args(["--log-config-path"])
+        .arg(&logging_config)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "run",
+            "--agent",
+            "claude",
+            "--dry-run",
+            "--",
+            "/opt/bin/claude-code.exe",
+            "-p",
+            "synthetic prompt",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("possible_duplicate_agent_executable"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("/opt/bin/claude-code.exe"));
+    assert!(!stderr.contains("synthetic prompt"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/opt/bin/claude-code.exe -p synthetic prompt"),
+        "{stdout}"
+    );
+
+    let diagnostic = read_jsonl_event(&log_path, "agent_invocation_warning");
+    assert_eq!(diagnostic["fields"]["agent"], "claude");
+    assert_eq!(diagnostic["fields"]["duplicate_executable"], "claude");
+    let diagnostic = diagnostic.to_string();
+    assert!(!diagnostic.contains("/opt/bin/claude-code.exe"));
+    assert!(!diagnostic.contains("synthetic prompt"));
+}
+
+#[test]
+fn invocation_diagnostic_does_not_preflight_live_launches() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"
+[agents.claude]
+command = "nemo-relay-test-agent-that-does-not-exist"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(gateway_bin())
+        .current_dir(temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("xdg"))
+        .env("HOME", temp.path())
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "run",
+            "--agent",
+            "claude",
+            "--",
+            "claude",
+            "private synthetic value",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("possible_duplicate_agent_executable"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("error_kind=io"), "{stderr}");
+}
+
+#[test]
+fn invocation_diagnostic_cli_ignores_agent_names_after_a_different_first_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"
+[upstream]
+openai_base_url = "http://127.0.0.1:1"
+anthropic_base_url = "http://127.0.0.1:1"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(gateway_bin())
+        .current_dir(temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("xdg"))
+        .env("HOME", temp.path())
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "run",
+            "--agent",
+            "claude",
+            "--dry-run",
+            "--",
+            "-p",
+            "compare claude with codex",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("possible_duplicate_agent_executable"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn invocation_diagnostic_cli_warns_for_agent_shortcut() {
+    let temp = tempfile::tempdir().unwrap();
+    let (logging_config, log_path) = write_jsonl_logging_config(temp.path());
+    let xdg = temp.path().join("xdg");
+    std::fs::create_dir_all(&xdg).unwrap();
+    let cwd = temp.path().join("workdir");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let output = Command::new(gateway_bin())
+        .current_dir(&cwd)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("HOME", temp.path())
+        .args(["--log-config-path"])
+        .arg(&logging_config)
+        .args([
+            "claude",
+            "--dry-run",
+            "--",
+            "claude",
+            "-p",
+            "private synthetic value",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("possible_duplicate_agent_executable"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("private synthetic value"), "{stderr}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let argv = stdout
+        .lines()
+        .find(|line| line.starts_with("argv = "))
+        .expect("dry run should print the resolved argv");
+    assert!(
+        argv.ends_with(" claude -p private synthetic value"),
+        "{argv}"
+    );
+
+    let diagnostic = read_jsonl_event(&log_path, "agent_invocation_warning").to_string();
+    assert!(!diagnostic.contains("private synthetic value"));
+    assert!(
+        !xdg.join("nemo-relay/config.toml").exists(),
+        "shortcut dry run must not invoke first-use setup"
+    );
 }
 
 #[test]
