@@ -2255,6 +2255,32 @@ fn gen_ai_projection_covers_message_variants_and_empty_input() {
             },
             {
                 "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-2",
+                    "content": "claude result"
+                }]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-3",
+                        "content": "mixed result"
+                    },
+                    {
+                        "type": "text",
+                        "text": "continue"
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": []
+            },
+            {
+                "role": "user",
                 "content": [
                     {
                         "type": "provider_native",
@@ -2308,6 +2334,32 @@ fn gen_ai_projection_covers_message_variants_and_empty_input() {
                     "id": "call-1",
                     "response": "result"
                 }]
+            },
+            {
+                "role": "tool",
+                "parts": [{
+                    "type": "tool_call_response",
+                    "id": "call-2",
+                    "response": "claude result"
+                }]
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "type": "tool_call_response",
+                        "id": "call-3",
+                        "response": "mixed result"
+                    },
+                    {
+                        "type": "text",
+                        "content": "continue"
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "parts": []
             },
             {
                 "role": "user",

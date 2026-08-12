@@ -355,7 +355,15 @@ fn input_message(message: &Message) -> Json {
         Message::Developer { content, name } => {
             ("developer", name.as_ref(), content_parts(content))
         }
-        Message::User { content, name } => ("user", name.as_ref(), content_parts(content)),
+        Message::User { content, name } => (
+            if is_tool_result_message(content) {
+                "tool"
+            } else {
+                "user"
+            },
+            name.as_ref(),
+            content_parts(content),
+        ),
         Message::Assistant {
             content,
             tool_calls,
@@ -439,6 +447,17 @@ fn input_message(message: &Message) -> Json {
         object.insert("name".to_string(), Json::String(name.clone()));
     }
     Json::Object(object)
+}
+
+fn is_tool_result_message(content: &MessageContent) -> bool {
+    matches!(
+        content,
+        MessageContent::Parts(parts)
+            if !parts.is_empty()
+                && parts
+                    .iter()
+                    .all(|part| matches!(part, ContentPart::ToolResult { .. }))
+    )
 }
 
 fn output_messages_json(response: &AnnotatedLlmResponse) -> Option<String> {
