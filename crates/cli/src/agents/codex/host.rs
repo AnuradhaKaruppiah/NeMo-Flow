@@ -20,16 +20,13 @@ use crate::hooks::generated_hooks;
 use crate::hooks::merge_hooks;
 
 use super::app_server::{CodexAppServerClient, CodexHookMetadata, CodexHooksClient};
-#[cfg(test)]
-use crate::agents::shared::host::write_json;
 use crate::agents::shared::host::{
     atomic_write_private, current_exe, ensure_table, home_dir, read_json_object, shell_quote,
     write_json_preserving_symlink,
 };
 use crate::filesystem::{
-    FileSnapshot, atomic_write_preserving_symlink, atomic_write_private_preserving_symlink, backup,
-    backup_path, remove_backup, remove_file_preserving_symlink, restore_file_snapshot,
-    snapshot_optional_file,
+    FileSnapshot, atomic_write_preserving_symlink, backup, backup_path, ensure_symlink_path,
+    remove_backup, remove_file_preserving_symlink, restore_file_snapshot, snapshot_optional_file,
 };
 use crate::process::{portable_executable_path, shell_quote_arg_for_platform};
 
@@ -37,7 +34,7 @@ pub(crate) const CODEX_PLUGIN_ID: &str = RELAY_PLUGIN_ID;
 pub(crate) const CODEX_PLUGIN_HOOK_KEY_PREFIX: &str =
     "nemo-relay-plugin@nemo-relay-local:hooks/hooks.json:";
 const ABSENT_CONFIG_BACKUP_KEY: &str = "__nemo_relay_original_config_absent";
-const ABSENT_HOOKS_BACKUP_KEY: &str = "__nemo_relay_original_hooks_absent";
+const CONFIG_SYMLINK_TARGET_BACKUP_KEY: &str = "__nemo_relay_original_config_symlink_target";
 
 pub(crate) struct CodexSetupSnapshot {
     files: Vec<FileSnapshot>,
@@ -740,6 +737,60 @@ fn restore_codex_install_snapshots(snapshots: &[FileSnapshot]) -> Result<(), Str
     }
 }
 
+fn codex_config_backup_symlink_target(path: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::read_link(path)
+            .map(Some)
+            .map_err(|error| format!("failed to read symlink {}: {error}", path.display())),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to inspect {} for symlink metadata: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn codex_backup_symlink_target(backup: &DocumentMut) -> Option<PathBuf> {
+    backup
+        .get(CONFIG_SYMLINK_TARGET_BACKUP_KEY)
+        .and_then(Item::as_value)
+        .and_then(TomlValue::as_str)
+        .map(PathBuf::from)
+}
+
+fn record_codex_config_backup_symlink_target(
+    backup: &mut DocumentMut,
+    symlink_target: &Path,
+) -> Result<(), String> {
+    let target = symlink_target.to_str().ok_or_else(|| {
+        format!(
+            "failed to persist original Codex config symlink target {}: path is not valid UTF-8",
+            symlink_target.display()
+        )
+    })?;
+    backup[CONFIG_SYMLINK_TARGET_BACKUP_KEY] = value(target);
+    Ok(())
+}
+
+fn write_initial_codex_config_backup(path: &Path, raw: &str) -> Result<(), String> {
+    let Some(symlink_target) = codex_config_backup_symlink_target(path)? else {
+        if !path.exists() {
+            return Ok(());
+        }
+        return atomic_write_private(&backup_path(path), raw.as_bytes());
+    };
+
+    let mut backup = raw
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))?;
+    if path_is_dangling_symlink(path)? {
+        backup[ABSENT_CONFIG_BACKUP_KEY] = value(true);
+    }
+    record_codex_config_backup_symlink_target(&mut backup, &symlink_target)?;
+    atomic_write_private(&backup_path(path), backup.to_string().as_bytes())
+}
+
 pub(crate) fn prepare_codex_config(path: &Path) -> Result<(), String> {
     let raw = read_optional_text(path)?;
     raw.parse::<DocumentMut>()
@@ -797,7 +848,7 @@ pub(crate) fn install_codex_config(path: &Path, gateway_url: &str) -> Result<(),
         merge_codex_provider_extensions(&mut doc, extensions);
     }
 
-    if let Err(error) = atomic_write_private_preserving_symlink(path, doc.to_string().as_bytes()) {
+    if let Err(error) = atomic_write_private(path, doc.to_string().as_bytes()) {
         restore_file_snapshot(&backup_snapshot)?;
         return Err(error);
     }
@@ -821,13 +872,7 @@ fn refresh_codex_config_backup(
     let previous = read_codex_backup_doc_for_refresh(path)?
         .map(|backup| sanitize_codex_backup_doc(backup, gateway_url, Some(challenge)));
     if previous.is_none() && !has_managed_proof {
-        if path_is_dangling_symlink(path)? {
-            return write_absent_codex_config_backup(path);
-        }
-        if !path.exists() {
-            return Ok(());
-        }
-        return atomic_write_private(&backup_path(path), raw.as_bytes());
+        return write_initial_codex_config_backup(path, raw);
     }
 
     let empty = DocumentMut::new();
@@ -843,6 +888,9 @@ fn refresh_codex_config_backup(
     }
     if codex_backup_marks_original_config_absent(previous) {
         baseline[ABSENT_CONFIG_BACKUP_KEY] = value(true);
+    }
+    if let Some(symlink_target) = codex_backup_symlink_target(previous) {
+        record_codex_config_backup_symlink_target(&mut baseline, &symlink_target)?;
     }
     remove_empty_table(&mut baseline, "model_providers");
     remove_empty_table(&mut baseline, "features");
@@ -1179,6 +1227,7 @@ pub(crate) fn uninstall_codex_config(
     let restore_dangling_symlink = backup_doc
         .as_ref()
         .is_some_and(codex_backup_marks_original_config_absent);
+    let original_symlink_target = backup_doc.as_ref().and_then(codex_backup_symlink_target);
     let preserved_provider = codex_extended_provider_without_proof(&doc, gateway_url);
     let provider_is_managed = codex_provider_item_is_managed(&doc, gateway_url);
     match backup_doc.as_ref() {
@@ -1205,8 +1254,21 @@ pub(crate) fn uninstall_codex_config(
 
     remove_empty_table(&mut doc, "model_providers");
     remove_empty_table(&mut doc, "features");
+    if let Some(target) = original_symlink_target.as_deref() {
+        ensure_symlink_path(path, target)?;
+    }
     if restore_dangling_symlink && doc.as_table().is_empty() {
-        remove_file_preserving_symlink(path)?;
+        if original_symlink_target.is_some() {
+            remove_file_preserving_symlink(path)?;
+        } else {
+            fs::remove_file(path)
+                .or_else(|error| {
+                    (error.kind() == std::io::ErrorKind::NotFound)
+                        .then_some(())
+                        .ok_or(error)
+                })
+                .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+        }
     } else {
         atomic_write_preserving_symlink(path, doc.to_string().as_bytes())?;
     }
@@ -1281,9 +1343,6 @@ pub(crate) fn install_codex_hooks(path: &Path, gateway_url: &str) -> Result<(), 
     let relay = current_exe()?;
     let command = codex_hook_command(gateway_url);
     let generated = generated_hooks(CodingAgent::Codex, &command);
-    if path_is_dangling_symlink(path)? && !backup_path(path).exists() {
-        write_absent_codex_hooks_backup(path)?;
-    }
     let mut existing = if path.exists() {
         let raw = fs::read_to_string(path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
@@ -1312,12 +1371,7 @@ pub(crate) fn uninstall_codex_hooks(path: &Path, _gateway_url: &str) -> Result<b
     let relay = current_exe()?;
     remove_managed_codex_hook_groups(&mut value, &relay, None);
     let has_remaining_hooks = hook_config_has_hook_groups(&value);
-    if !has_remaining_hooks && hooks_backup_marks_original_absent(path)? {
-        remove_file_preserving_symlink(path)?;
-        remove_backup(path)?;
-    } else {
-        write_json_preserving_symlink(path, &value)?;
-    }
+    write_json_preserving_symlink(path, &value)?;
     Ok(has_remaining_hooks)
 }
 
@@ -1333,41 +1387,12 @@ fn path_is_dangling_symlink(path: &Path) -> Result<bool, String> {
     }
 }
 
-fn write_absent_codex_config_backup(path: &Path) -> Result<(), String> {
-    let backup = backup_path(path);
-    if let Some(parent) = backup.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    }
-    atomic_write_private(
-        &backup,
-        format!("{ABSENT_CONFIG_BACKUP_KEY} = true\n").as_bytes(),
-    )
-}
-
 fn codex_backup_marks_original_config_absent(backup: &DocumentMut) -> bool {
     backup
         .get(ABSENT_CONFIG_BACKUP_KEY)
         .and_then(Item::as_value)
         .and_then(TomlValue::as_bool)
         == Some(true)
-}
-
-#[cfg(test)]
-fn write_absent_codex_hooks_backup(path: &Path) -> Result<(), String> {
-    write_json(
-        &backup_path(path),
-        &json!({ ABSENT_HOOKS_BACKUP_KEY: true }),
-    )
-}
-
-fn hooks_backup_marks_original_absent(path: &Path) -> Result<bool, String> {
-    let backup = backup_path(path);
-    if !backup.exists() {
-        return Ok(false);
-    }
-    let value = read_json_object(&backup)?;
-    Ok(value.get(ABSENT_HOOKS_BACKUP_KEY).and_then(Value::as_bool) == Some(true))
 }
 
 pub(crate) fn remove_managed_codex_hook_groups(

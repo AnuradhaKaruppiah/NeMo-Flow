@@ -1344,14 +1344,23 @@ fn codex_install_and_uninstall_preserve_symlinked_config_path() {
 
     install_codex_config(&path, DEFAULT_URL).unwrap();
     assert!(
-        fs::symlink_metadata(&path)
+        !fs::symlink_metadata(&path)
             .unwrap()
             .file_type()
             .is_symlink()
     );
-    let installed = fs::read_to_string(&target).unwrap();
+    let installed = fs::read_to_string(&path).unwrap();
     assert!(installed.contains("model_provider = \"nemo-relay-openai\""));
     assert!(installed.contains("custom = \"target-marker\""));
+    assert!(installed.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
+    let installed = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        installed,
+        "model_provider = \"openai\"\ncustom = \"target-marker\"\n"
+    );
+    let backup = fs::read_to_string(backup_path(&path)).unwrap();
+    assert!(backup.contains("__nemo_relay_original_config_symlink_target"));
+    assert!(!backup.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
 
     uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
     assert!(
@@ -1391,12 +1400,20 @@ fn codex_install_and_uninstall_restore_dangling_symlinked_config_path() {
 
     install_codex_config(&path, DEFAULT_URL).unwrap();
     assert!(
-        fs::symlink_metadata(&path)
+        !fs::symlink_metadata(&path)
             .unwrap()
             .file_type()
             .is_symlink()
     );
-    assert!(target.exists());
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .contains(BOOTSTRAP_CLIENT_TOKEN_HEADER)
+    );
+    assert!(!target.exists());
+    let backup = fs::read_to_string(backup_path(&path)).unwrap();
+    assert!(backup.contains("__nemo_relay_original_config_absent = true"));
+    assert!(backup.contains("__nemo_relay_original_config_symlink_target"));
 
     uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
     assert!(
@@ -1406,6 +1423,52 @@ fn codex_install_and_uninstall_restore_dangling_symlinked_config_path() {
             .is_symlink()
     );
     assert!(!target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_reinstall_restores_original_symlink_after_user_edits_materialized_config() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let codex_dir = dir.path().join(".codex");
+    let linked_dir = dir.path().join("linked");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::create_dir_all(&linked_dir).unwrap();
+
+    let target = linked_dir.join("config-target.toml");
+    fs::write(
+        &target,
+        "model_provider = \"openai\"\ncustom = \"target-marker\"\n",
+    )
+    .unwrap();
+    let path = codex_dir.join("config.toml");
+    symlink(&target, &path).unwrap();
+
+    install_codex_config(&path, DEFAULT_URL).unwrap();
+
+    let mut edited = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    edited["custom"] = Item::Value(TomlValue::from("edited-marker"));
+    fs::write(&path, edited.to_string()).unwrap();
+
+    install_codex_config(&path, DEFAULT_URL).unwrap();
+    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&path).unwrap(), target);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "model_provider = \"openai\"\ncustom = \"edited-marker\"\n"
+    );
 }
 
 #[test]
@@ -3320,7 +3383,7 @@ fn codex_install_and_uninstall_preserve_symlinked_hooks_path() {
 
 #[cfg(unix)]
 #[test]
-fn codex_install_and_uninstall_restore_dangling_symlinked_hooks_path() {
+fn codex_install_migration_preserves_symlinked_legacy_hooks_path() {
     use std::os::unix::fs::symlink;
 
     let dir = tempdir().unwrap();
@@ -3329,34 +3392,47 @@ fn codex_install_and_uninstall_restore_dangling_symlinked_hooks_path() {
     fs::create_dir_all(&codex_dir).unwrap();
     fs::create_dir_all(&linked_dir).unwrap();
 
-    let target = linked_dir.join("hooks-target.json");
     let path = codex_dir.join("hooks.json");
+    let target = linked_dir.join("hooks-target.json");
+    let relay = current_exe().unwrap();
+    let legacy_command = legacy_codex_hook_command(&relay);
+    fs::write(
+        &target,
+        serde_json::to_vec_pretty(&json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [
+                        {"type": "command", "command": legacy_command, "timeout": 30},
+                        {"type": "command", "command": "custom-user-hook", "timeout": 30}
+                    ]
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     symlink(&target, &path).unwrap();
-    assert!(
-        fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert!(!target.exists());
 
-    install_codex_hooks(&path, DEFAULT_URL).unwrap();
-    assert!(
-        fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert!(target.exists());
+    remove_legacy_codex_hooks(&path).unwrap();
 
-    uninstall_codex_hooks(&path, DEFAULT_URL).unwrap();
     assert!(
         fs::symlink_metadata(&path)
             .unwrap()
             .file_type()
             .is_symlink()
     );
-    assert!(!target.exists());
+    assert_eq!(fs::read_link(&path).unwrap(), target);
+    let updated: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+    assert!(!event_contains_command(
+        &updated,
+        "SessionStart",
+        &legacy_command
+    ));
+    assert!(event_contains_command(
+        &updated,
+        "SessionStart",
+        "custom-user-hook"
+    ));
 }
 
 #[test]

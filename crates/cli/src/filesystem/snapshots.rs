@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::atomic::{atomic_write, atomic_write_private, atomic_write_with_permissions};
+use super::atomic::{atomic_write, atomic_write_with_permissions};
 #[cfg(windows)]
 use super::{atomic_write_with_windows_dacl, read_windows_dacl};
 
@@ -120,14 +120,6 @@ pub(crate) fn atomic_write_preserving_symlink(path: &Path, bytes: &[u8]) -> Resu
     atomic_write(&path, bytes)
 }
 
-pub(crate) fn atomic_write_private_preserving_symlink(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(), String> {
-    let path = resolved_symlink_target_path(path)?;
-    atomic_write_private(&path, bytes)
-}
-
 pub(crate) fn remove_file_preserving_symlink(path: &Path) -> Result<(), String> {
     let path = resolved_symlink_target_path(path)?;
     match fs::remove_file(&path) {
@@ -139,7 +131,7 @@ pub(crate) fn remove_file_preserving_symlink(path: &Path) -> Result<(), String> 
 
 fn restore_path(snapshot: &FileSnapshot) -> Result<PathBuf, String> {
     if let Some(link_target) = snapshot.symlink_target.as_deref() {
-        ensure_symlink(&snapshot.path, link_target)?;
+        ensure_symlink_path(&snapshot.path, link_target)?;
         resolved_symlink_target_path(&snapshot.path)
     } else {
         Ok(snapshot.path.clone())
@@ -193,7 +185,7 @@ fn resolved_symlink_target_path(path: &Path) -> Result<PathBuf, String> {
     ))
 }
 
-fn ensure_symlink(path: &Path, target: &Path) -> Result<(), String> {
+pub(crate) fn ensure_symlink_path(path: &Path, target: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             let current = fs::read_link(path)
