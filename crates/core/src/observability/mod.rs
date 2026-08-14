@@ -44,7 +44,12 @@ pub(crate) mod manual;
 pub(crate) mod openinference;
 pub mod otel;
 mod otel_genai;
+pub mod otel_logs;
+pub mod otel_metrics;
+mod otel_signal;
 pub mod plugin_component;
+
+pub use otel_signal::{OpenTelemetryRuntimeDiagnostic, OpenTelemetryRuntimeDiagnostics};
 
 /// Return the provider-independent input total used by semantic observability
 /// projections. Anthropic reports uncached, cache-read, and cache-creation

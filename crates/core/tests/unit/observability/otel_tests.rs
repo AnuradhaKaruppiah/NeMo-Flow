@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::api::event::{
-    BaseEvent, CategoryProfile, Event, EventCategory, MarkEvent, ScopeCategory, ScopeEvent,
-    tool_attributes_to_strings,
+    BaseEvent, CategoryProfile, DataSchema, Event, EventCategory, METRIC_DATA_SCHEMA_NAME,
+    METRIC_DATA_SCHEMA_VERSION, MarkEvent, ScopeCategory, ScopeEvent, tool_attributes_to_strings,
 };
 use crate::api::runtime::{
     NemoRelayContextState, PropagationContext, ThreadScopeStackBinding,
@@ -771,7 +771,7 @@ fn assert_config_defaults(defaults: &OpenTelemetryConfig) {
 }
 
 #[test]
-fn http_trace_endpoint_resolution_completes_only_bare_http_urls() {
+fn http_trace_endpoint_resolution_preserves_an_explicit_root_path() {
     for (endpoint, expected) in [
         ("http://localhost:4318", "http://localhost:4318/v1/traces"),
         ("http://localhost:4318/", "http://localhost:4318/"),
@@ -782,6 +782,10 @@ fn http_trace_endpoint_resolution_completes_only_bare_http_urls() {
         (
             "https://collector.example/?tenant=one",
             "https://collector.example/?tenant=one",
+        ),
+        (
+            "https://collector.example/#root",
+            "https://collector.example/#root",
         ),
         (
             "http://localhost:4318/v1/traces",
@@ -2656,6 +2660,123 @@ fn records_span_start_mark_and_end() {
 }
 
 #[test]
+fn metric_schema_marks_are_not_projected_to_direct_traces() {
+    let (provider, exporter) = make_provider();
+    let mut processor = OtelEventProcessor::new(provider.clone(), "test-scope".to_string());
+    let root_uuid = Uuid::now_v7();
+
+    processor.process(&make_start_event(
+        root_uuid,
+        None,
+        "agent",
+        ScopeType::Agent,
+        None,
+    ));
+    processor.process(&Event::Mark(MarkEvent::new(
+        BaseEvent::builder()
+            .parent_uuid(root_uuid)
+            .name("tokens-saved")
+            .data(json!({
+                "measurements": [{
+                    "name": "example.tokens.saved",
+                    "kind": "counter",
+                    "value_type": "u64",
+                    "value": 42
+                }]
+            }))
+            .data_schema(
+                DataSchema::builder()
+                    .name(METRIC_DATA_SCHEMA_NAME)
+                    .version(METRIC_DATA_SCHEMA_VERSION)
+                    .build(),
+            )
+            .build(),
+        None,
+        None,
+    )));
+    processor.process(&Event::Mark(MarkEvent::new(
+        BaseEvent::builder()
+            .parent_uuid(root_uuid)
+            .name("future-metric")
+            .data(json!({"measurements": []}))
+            .data_schema(
+                DataSchema::builder()
+                    .name(METRIC_DATA_SCHEMA_NAME)
+                    .version("999")
+                    .build(),
+            )
+            .build(),
+        None,
+        None,
+    )));
+    processor.process(&Event::Mark(MarkEvent::new(
+        BaseEvent::builder()
+            .parent_uuid(root_uuid)
+            .name("invalid-metric")
+            .data(json!({"measurements": []}))
+            .data_schema(
+                DataSchema::builder()
+                    .name(METRIC_DATA_SCHEMA_NAME)
+                    .version(METRIC_DATA_SCHEMA_VERSION)
+                    .build(),
+            )
+            .build(),
+        None,
+        None,
+    )));
+    processor.process(&make_mark_event(Some(root_uuid), "routing-decision", None));
+    processor.process(&make_end_event(
+        root_uuid,
+        None,
+        "agent",
+        ScopeType::Agent,
+        None,
+    ));
+    processor.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].events.events.len(), 1);
+    assert_eq!(spans[0].events.events[0].name.as_ref(), "routing-decision");
+    assert_eq!(processor.invalid_metric_count, 2);
+}
+
+#[test]
+fn direct_trace_subscriber_exposes_runtime_diagnostics() {
+    let (provider, _exporter) = make_provider();
+    let subscriber = OpenTelemetrySubscriber::from_tracer_provider(provider, "diagnostics");
+    let event = Event::Mark(MarkEvent::new(
+        BaseEvent::builder()
+            .name("invalid-metric")
+            .data(json!({"measurements": []}))
+            .data_schema(
+                DataSchema::builder()
+                    .name(METRIC_DATA_SCHEMA_NAME)
+                    .version("999")
+                    .build(),
+            )
+            .build(),
+        None,
+        None,
+    ));
+
+    for _ in 0..3 {
+        (subscriber.subscriber())(&event);
+    }
+
+    let diagnostics = subscriber.runtime_diagnostics();
+    let diagnostic = diagnostics
+        .get("otel.metric_mark_invalid")
+        .expect("invalid metric diagnostic");
+    assert_eq!(diagnostic.count, 3);
+    assert!(
+        diagnostic
+            .message
+            .contains("unsupported metric schema version")
+    );
+}
+
+#[test]
 fn derives_span_ids_from_relay_uuids() {
     let (provider, exporter) = make_provider();
     let mut processor = OtelEventProcessor::new_with_mark_projection(
@@ -3854,7 +3975,7 @@ fn provider_builders_cover_success_paths() {
             .with_max_queue_size(16)
             .with_max_export_batch_size(4)
             .with_scheduled_delay(Duration::from_millis(10)),
-        None,
+        SignalRuntimeDiagnostics::new(None),
     )
     .unwrap();
     http_provider.force_flush().unwrap();
@@ -3880,10 +4001,12 @@ fn dropped_spans_are_recorded_in_the_active_plugin_report() {
     .unwrap();
 
     let exporter = BlockingSpanExporter::default();
+    let runtime_diagnostics =
+        SignalRuntimeDiagnostics::new(Some("opentelemetry.endpoints[2].endpoint".to_string()));
     let processor = DiagnosticBatchSpanProcessor::new_with_batch_config(
         exporter.clone(),
         "https://collector.example/v1/traces".to_string(),
-        Some("opentelemetry.endpoints[2].endpoint".to_string()),
+        runtime_diagnostics.clone(),
         BatchConfigBuilder::default()
             .with_max_queue_size(1)
             .with_max_export_batch_size(1)
@@ -3924,6 +4047,13 @@ fn dropped_spans_are_recorded_in_the_active_plugin_report() {
             .message
             .contains("https://collector.example/v1/traces")
     );
+    assert_eq!(
+        runtime_diagnostics
+            .snapshot()
+            .get("otel.spans_dropped")
+            .map(|diagnostic| diagnostic.count),
+        Some(2)
+    );
 }
 
 #[test]
@@ -3947,7 +4077,7 @@ fn grpc_metadata_and_runtime_builder_paths_succeed() {
             &OpenTelemetryConfig::grpc("grpc-demo")
                 .with_endpoint("http://127.0.0.1:4317")
                 .with_header("authorization", "Bearer token"),
-            None,
+            SignalRuntimeDiagnostics::new(None),
         )
         .unwrap();
         provider.force_flush().ok();

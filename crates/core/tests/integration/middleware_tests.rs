@@ -22,7 +22,8 @@ use test_support::{ready, ready_result};
 
 use futures::StreamExt;
 use nemo_relay::api::event::{
-    CategoryProfile, DataSchema, Event, EventCategory, PendingMarkSpec, ScopeCategory,
+    CategoryProfile, DataSchema, Event, EventCategory, LOG_SEVERITY_METADATA_KEY, LogSeverity,
+    PendingMarkSpec, ScopeCategory,
 };
 use nemo_relay::api::llm::{
     LlmCallExecuteParams, LlmStreamCallExecuteParams, llm_call_execute, llm_request_intercepts,
@@ -1122,8 +1123,15 @@ async fn test_tool_execution_outcome_marks_follow_end_with_tool_parentage() {
                 Box::pin(async move {
                     let mut result = next(args).await?;
                     result.result["compressed"] = json!(true);
-                    Ok(
-                        ToolExecutionInterceptOutcome::from(result).with_pending_mark(
+                    Ok(ToolExecutionInterceptOutcome::from(result)
+                        .with_pending_mark(
+                            PendingMarkSpec::builder()
+                                .name("tool.mark.invalid")
+                                .metadata(json!("not an object"))
+                                .severity(LogSeverity::Info)
+                                .build(),
+                        )
+                        .with_pending_mark(
                             PendingMarkSpec::builder()
                                 .name("tool.mark.inner")
                                 .category(EventCategory::custom())
@@ -1133,10 +1141,16 @@ async fn test_tool_execution_outcome_marks_follow_end_with_tool_parentage() {
                                         .build(),
                                 )
                                 .data(json!({"saved_tokens": 12}))
+                                .data_schema(
+                                    DataSchema::builder()
+                                        .name("example.tool_pending_mark")
+                                        .version("1")
+                                        .build(),
+                                )
                                 .metadata(json!({"source": "test"}))
+                                .severity(LogSeverity::Error)
                                 .build(),
-                        ),
-                    )
+                        ))
                 })
             }),
         )
@@ -1172,6 +1186,11 @@ async fn test_tool_execution_outcome_marks_follow_end_with_tool_parentage() {
         .iter()
         .position(|event| event.name() == "tool.mark.inner")
         .unwrap();
+    assert!(
+        captured
+            .iter()
+            .all(|event| event.name() != "tool.mark.invalid")
+    );
     let outer_index = captured
         .iter()
         .position(|event| event.name() == "tool.mark.outer")
@@ -1200,6 +1219,17 @@ async fn test_tool_execution_outcome_marks_follow_end_with_tool_parentage() {
     );
     assert_eq!(inner.data().unwrap()["saved_tokens"], 12);
     assert_eq!(inner.metadata().unwrap()["source"], "test");
+    assert_eq!(
+        inner.metadata().unwrap()[LOG_SEVERITY_METADATA_KEY],
+        "error"
+    );
+    assert_eq!(
+        inner.data_schema().unwrap(),
+        &DataSchema::builder()
+            .name("example.tool_pending_mark")
+            .version("1")
+            .build()
+    );
     drop(captured);
 
     deregister_tool_execution_intercept("passthrough_between_outcomes").unwrap();
@@ -5243,7 +5273,9 @@ async fn test_managed_llm_emits_pending_marks_under_started_scope() {
         "llm_pending_mark_sanitizer",
         1,
         Arc::new(|event, mut fields| {
-            fields.metadata = Some(json!({"sanitized_mark": event.name()}));
+            let mut metadata = fields.metadata.unwrap_or_else(|| json!({}));
+            metadata["sanitized_mark"] = json!(event.name());
+            fields.metadata = Some(metadata);
             ready(fields)
         }),
     )
@@ -5257,6 +5289,13 @@ async fn test_managed_llm_emits_pending_marks_under_started_scope() {
                 LlmRequestInterceptOutcome::new(request, annotated)
                     .with_pending_mark(
                         PendingMarkSpec::builder()
+                            .name("request.optimized.invalid")
+                            .metadata(json!("not an object"))
+                            .severity(LogSeverity::Info)
+                            .build(),
+                    )
+                    .with_pending_mark(
+                        PendingMarkSpec::builder()
                             .name("request.optimized")
                             .category(EventCategory::custom())
                             .category_profile(
@@ -5265,6 +5304,14 @@ async fn test_managed_llm_emits_pending_marks_under_started_scope() {
                                     .build(),
                             )
                             .data(json!({"saved_tokens": 12}))
+                            .data_schema(
+                                DataSchema::builder()
+                                    .name("example.llm_pending_mark")
+                                    .version("1")
+                                    .build(),
+                            )
+                            .metadata(json!({(LOG_SEVERITY_METADATA_KEY): "debug"}))
+                            .severity(LogSeverity::Warn)
                             .build(),
                     )
                     .with_pending_mark(
@@ -5323,6 +5370,11 @@ async fn test_managed_llm_emits_pending_marks_under_started_scope() {
         .iter()
         .find(|event| event.name() == "request.optimized.second")
         .unwrap();
+    assert!(
+        captured
+            .iter()
+            .all(|event| event.name() != "request.optimized.invalid")
+    );
     let end = captured
         .iter()
         .find(|event| {
@@ -5336,6 +5388,14 @@ async fn test_managed_llm_emits_pending_marks_under_started_scope() {
     assert_eq!(mark.timestamp(), second_mark.timestamp());
     assert!(end.timestamp() >= mark.timestamp());
     assert_eq!(mark.data().unwrap()["saved_tokens"], 12);
+    assert_eq!(
+        mark.data_schema().unwrap(),
+        &DataSchema::builder()
+            .name("example.llm_pending_mark")
+            .version("1")
+            .build()
+    );
+    assert_eq!(mark.metadata().unwrap()[LOG_SEVERITY_METADATA_KEY], "warn");
     assert_eq!(
         mark.metadata().unwrap()["sanitized_mark"],
         "request.optimized"
