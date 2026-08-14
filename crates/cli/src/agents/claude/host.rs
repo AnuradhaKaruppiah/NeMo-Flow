@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 
 use crate::agents::shared::host::{home_dir, read_json_object, write_json};
 use crate::filesystem::{
-    FileSnapshot, backup, backup_path, remove_backup, restore_file_snapshot, snapshot_optional_file,
+    FileSnapshot, backup, backup_path, remove_backup, remove_file_preserving_symlink,
+    restore_file_snapshot, snapshot_optional_file,
 };
 
 const ABSENT_SETTINGS_BACKUP_KEY: &str = "__nemo_relay_original_settings_absent";
@@ -113,13 +114,7 @@ pub(crate) fn restore_claude_provider(gateway_url: &str) -> Result<(), String> {
         if backup_settings.get(ABSENT_SETTINGS_BACKUP_KEY) == Some(&Value::Bool(true))
             && settings.as_object().is_some_and(serde_json::Map::is_empty)
         {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!("failed to remove {}: {error}", path.display()));
-                }
-            }
+            remove_file_preserving_symlink(&path)?;
         } else {
             write_json(&path, &settings)?;
         }

@@ -18,7 +18,9 @@ use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
 use super::*;
 use crate::configuration::{BOOTSTRAP_CLIENT_TOKEN_HEADER, BootstrapChallengeKey};
-use crate::filesystem::{backup, backup_path, restore_file_snapshot, snapshot_optional_file};
+use crate::filesystem::{
+    atomic_write, backup, backup_path, restore_file_snapshot, snapshot_optional_file,
+};
 
 const TEST_PLUGIN_GENERATION: &str = "test-generation";
 
@@ -1310,6 +1312,57 @@ fn codex_install_tightens_the_secret_bearing_config_to_owner_only() {
     assert_eq!(
         fs::metadata(path).unwrap().permissions().mode() & 0o777,
         0o600
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_install_and_uninstall_preserve_symlinked_config_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let codex_dir = dir.path().join(".codex");
+    let linked_dir = dir.path().join("linked");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::create_dir_all(&linked_dir).unwrap();
+
+    let target = linked_dir.join("config-target.toml");
+    fs::write(
+        &target,
+        "model_provider = \"openai\"\ncustom = \"target-marker\"\n",
+    )
+    .unwrap();
+    let path = codex_dir.join("config.toml");
+    symlink(&target, &path).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    install_codex_config(&path, DEFAULT_URL).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let installed = fs::read_to_string(&target).unwrap();
+    assert!(installed.contains("model_provider = \"nemo-relay-openai\""));
+    assert!(installed.contains("custom = \"target-marker\""));
+
+    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "model_provider = \"openai\"\ncustom = \"target-marker\"\n"
     );
 }
 
@@ -3174,6 +3227,55 @@ fn codex_install_hooks_persist_custom_gateway_url() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_install_and_uninstall_preserve_symlinked_hooks_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let codex_dir = dir.path().join(".codex");
+    let linked_dir = dir.path().join("linked");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::create_dir_all(&linked_dir).unwrap();
+
+    let target = linked_dir.join("hooks-target.json");
+    fs::write(
+        &target,
+        "{\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"user-hook\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"user-hook-command\"\n          }\n        ]\n      }\n    ]\n  }\n}\n",
+    )
+    .unwrap();
+    let path = codex_dir.join("hooks.json");
+    symlink(&target, &path).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    install_codex_hooks(&path, DEFAULT_URL).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let installed = fs::read_to_string(&target).unwrap();
+    assert!(installed.contains("user-hook-command"));
+    assert!(installed.contains("hook-forward codex"));
+
+    uninstall_codex_hooks(&path, DEFAULT_URL).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let restored = fs::read_to_string(&target).unwrap();
+    assert!(restored.contains("user-hook-command"));
+    assert!(!restored.contains("hook-forward codex"));
+}
+
 #[test]
 fn codex_install_migration_removes_legacy_relay_groups_and_preserves_unrelated_hooks() {
     let dir = tempdir().unwrap();
@@ -3785,6 +3887,67 @@ fn claude_restore_removes_settings_created_from_an_absent_original() {
     restore_claude_provider(DEFAULT_URL).unwrap();
 
     assert!(!settings_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_provider_enable_and_restore_preserve_symlinked_settings_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let linked_dir = dir.path().join("linked");
+    fs::create_dir_all(&linked_dir).unwrap();
+    let target = linked_dir.join("settings-target.json");
+    fs::write(
+        &target,
+        serde_json::to_vec_pretty(&json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                "OTHER": "kept"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let settings_path = claude_settings_path().unwrap();
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    symlink(&target, &settings_path).unwrap();
+    assert!(
+        fs::symlink_metadata(&settings_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    enable_claude_provider(DEFAULT_URL).unwrap();
+    assert!(
+        fs::symlink_metadata(&settings_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let installed: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+    assert_eq!(
+        json_env_string(&installed, "ANTHROPIC_BASE_URL"),
+        Some(DEFAULT_URL)
+    );
+    assert_eq!(json_env_string(&installed, "OTHER"), Some("kept"));
+
+    restore_claude_provider(DEFAULT_URL).unwrap();
+    assert!(
+        fs::symlink_metadata(&settings_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let restored: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+    assert_eq!(
+        json_env_string(&restored, "ANTHROPIC_BASE_URL"),
+        Some("https://api.anthropic.com")
+    );
+    assert_eq!(json_env_string(&restored, "OTHER"), Some("kept"));
 }
 
 #[test]

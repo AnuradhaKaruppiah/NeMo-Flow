@@ -21,11 +21,12 @@ use crate::hooks::merge_hooks;
 
 use super::app_server::{CodexAppServerClient, CodexHookMetadata, CodexHooksClient};
 use crate::agents::shared::host::{
-    atomic_write, atomic_write_private, current_exe, ensure_table, home_dir, read_json_object,
-    shell_quote, write_json,
+    atomic_write_private, current_exe, ensure_table, home_dir, read_json_object, shell_quote,
+    write_json,
 };
 use crate::filesystem::{
-    FileSnapshot, backup, backup_path, remove_backup, restore_file_snapshot, snapshot_optional_file,
+    FileSnapshot, atomic_write_preserving_symlink, atomic_write_private_preserving_symlink, backup,
+    backup_path, remove_backup, restore_file_snapshot, snapshot_optional_file,
 };
 use crate::process::{portable_executable_path, shell_quote_arg_for_platform};
 
@@ -791,7 +792,7 @@ pub(crate) fn install_codex_config(path: &Path, gateway_url: &str) -> Result<(),
         merge_codex_provider_extensions(&mut doc, extensions);
     }
 
-    if let Err(error) = atomic_write_private(path, doc.to_string().as_bytes()) {
+    if let Err(error) = atomic_write_private_preserving_symlink(path, doc.to_string().as_bytes()) {
         restore_file_snapshot(&backup_snapshot)?;
         return Err(error);
     }
@@ -1190,7 +1191,7 @@ pub(crate) fn uninstall_codex_config(
 
     remove_empty_table(&mut doc, "model_providers");
     remove_empty_table(&mut doc, "features");
-    atomic_write(path, doc.to_string().as_bytes())?;
+    atomic_write_preserving_symlink(path, doc.to_string().as_bytes())?;
     remove_backup(path)
 }
 
@@ -1279,7 +1280,7 @@ pub(crate) fn install_codex_hooks(path: &Path, gateway_url: &str) -> Result<(), 
     let bytes = serde_json::to_vec_pretty(&merged).map_err(|error| error.to_string())?;
     let mut output = bytes;
     output.push(b'\n');
-    atomic_write(path, &output)
+    atomic_write_preserving_symlink(path, &output)
 }
 
 pub(crate) fn uninstall_codex_hooks(path: &Path, _gateway_url: &str) -> Result<bool, String> {

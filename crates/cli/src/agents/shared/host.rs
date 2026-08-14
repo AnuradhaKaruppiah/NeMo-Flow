@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 use toml_edit::{DocumentMut, Item, Table};
 
 pub(crate) use crate::bootstrap::current_exe;
-pub(crate) use crate::filesystem::{atomic_write, atomic_write_private};
+use crate::filesystem::atomic_write_preserving_symlink;
+pub(crate) use crate::filesystem::atomic_write_private;
 pub(crate) use crate::gateway::client::healthz;
 
 pub(crate) fn shell_quote(path: &Path) -> String {
@@ -47,7 +48,7 @@ pub(crate) fn read_json_object(path: &Path) -> Result<Value, String> {
 pub(crate) fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
-    atomic_write(path, &bytes)
+    atomic_write_preserving_symlink(path, &bytes)
 }
 
 pub(crate) fn home_dir() -> Result<PathBuf, String> {
