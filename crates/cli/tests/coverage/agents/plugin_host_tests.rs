@@ -1377,6 +1377,39 @@ fn codex_install_and_uninstall_preserve_symlinked_config_path() {
 
 #[cfg(unix)]
 #[test]
+fn codex_install_allows_non_utf8_symlink_target_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let codex_dir = dir.path().join(".codex");
+    let linked_dir = dir.path().join("linked");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::create_dir_all(&linked_dir).unwrap();
+
+    let target_name = OsString::from_vec(vec![
+        b'c', b'o', b'n', b'f', b'i', b'g', 0xff, b'.', b't', b'o', b'm', b'l',
+    ]);
+    let target = linked_dir.join(PathBuf::from(target_name));
+
+    let path = codex_dir.join("config.toml");
+    symlink(&target, &path).unwrap();
+
+    install_codex_config(&path, DEFAULT_URL).unwrap();
+
+    let installed = fs::read_to_string(&path).unwrap();
+    assert!(installed.contains("model_provider = \"nemo-relay-openai\""));
+    assert!(installed.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
+
+    let backup = fs::read_to_string(backup_path(&path)).unwrap();
+    assert!(backup.contains("__nemo_relay_original_config_absent = true"));
+    assert!(!backup.contains("__nemo_relay_original_config_symlink_target"));
+}
+
+#[cfg(unix)]
+#[test]
 fn codex_install_and_uninstall_restore_dangling_symlinked_config_path() {
     use std::os::unix::fs::symlink;
 

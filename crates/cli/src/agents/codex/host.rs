@@ -763,12 +763,9 @@ fn record_codex_config_backup_symlink_target(
     backup: &mut DocumentMut,
     symlink_target: &Path,
 ) -> Result<(), String> {
-    let target = symlink_target.to_str().ok_or_else(|| {
-        format!(
-            "failed to persist original Codex config symlink target {}: path is not valid UTF-8",
-            symlink_target.display()
-        )
-    })?;
+    let Some(target) = symlink_target.to_str() else {
+        return Ok(());
+    };
     backup[CONFIG_SYMLINK_TARGET_BACKUP_KEY] = value(target);
     Ok(())
 }
