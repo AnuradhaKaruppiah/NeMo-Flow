@@ -1366,6 +1366,48 @@ fn codex_install_and_uninstall_preserve_symlinked_config_path() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_install_and_uninstall_restore_dangling_symlinked_config_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let codex_dir = dir.path().join(".codex");
+    let linked_dir = dir.path().join("linked");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::create_dir_all(&linked_dir).unwrap();
+
+    let target = linked_dir.join("config-target.toml");
+    let path = codex_dir.join("config.toml");
+    symlink(&target, &path).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!target.exists());
+
+    install_codex_config(&path, DEFAULT_URL).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(target.exists());
+
+    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!target.exists());
+}
+
 #[test]
 fn codex_reinstall_refreshes_a_stale_backup_before_overwriting_user_changes() {
     let dir = tempdir().unwrap();
@@ -3274,6 +3316,47 @@ fn codex_install_and_uninstall_preserve_symlinked_hooks_path() {
     let restored = fs::read_to_string(&target).unwrap();
     assert!(restored.contains("user-hook-command"));
     assert!(!restored.contains("hook-forward codex"));
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_install_and_uninstall_restore_dangling_symlinked_hooks_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let codex_dir = dir.path().join(".codex");
+    let linked_dir = dir.path().join("linked");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::create_dir_all(&linked_dir).unwrap();
+
+    let target = linked_dir.join("hooks-target.json");
+    let path = codex_dir.join("hooks.json");
+    symlink(&target, &path).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!target.exists());
+
+    install_codex_hooks(&path, DEFAULT_URL).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(target.exists());
+
+    uninstall_codex_hooks(&path, DEFAULT_URL).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!target.exists());
 }
 
 #[test]
