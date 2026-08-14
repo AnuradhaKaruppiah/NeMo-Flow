@@ -15,7 +15,7 @@ use crate::api::runtime::{
     EventSubscriberFn, ScopeStackHandle, ToolExecutionNextFn, with_active_event_uuid,
 };
 use crate::api::scope::event;
-use crate::api::scope::{EmitMarkEventParams, ScopeHandle};
+use crate::api::scope::{EmitMarkEventParams, ScopeHandle, metadata_with_log_severity};
 use crate::api::shared::{
     ensure_runtime_owner, metadata_with_otel_error, metadata_with_otel_status, resolve_parent_uuid,
     snapshot_event_sanitizers, snapshot_event_subscribers,
@@ -557,25 +557,39 @@ async fn tool_call_end_with_pending_marks(
                 .build(),
         )
     };
-    let marks = pending_marks
-        .into_iter()
-        .enumerate()
-        .map(|(index, mark)| {
-            let timestamp = *event.timestamp()
-                + TimeDelta::microseconds(i64::try_from(index).unwrap_or_default() + 1);
-            Event::Mark(MarkEvent::new(
-                BaseEvent::builder()
-                    .name(mark.name)
-                    .parent_uuid(params.handle.uuid)
-                    .timestamp(timestamp)
-                    .data_opt(mark.data)
-                    .metadata_opt(mark.metadata)
-                    .build(),
-                mark.category,
-                mark.category_profile,
-            ))
-        })
-        .collect::<Vec<_>>();
+    let mut marks = Vec::with_capacity(pending_marks.len());
+    for (index, mark) in pending_marks.into_iter().enumerate() {
+        let timestamp = *event.timestamp()
+            + TimeDelta::microseconds(i64::try_from(index).unwrap_or_default() + 1);
+        let metadata = match metadata_with_log_severity(mark.metadata, mark.severity) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let tool_uuid = params.handle.uuid.to_string();
+                log::warn!(
+                    target: "nemo_relay.observability",
+                    event = "tool_pending_mark_dropped",
+                    tool_name = params.handle.name.as_str(),
+                    tool_uuid = tool_uuid.as_str(),
+                    pending_mark_index = index,
+                    pending_mark_name = mark.name.as_str();
+                    "Tool pending mark was dropped because its severity metadata is invalid: {error}"
+                );
+                continue;
+            }
+        };
+        marks.push(Event::Mark(MarkEvent::new(
+            BaseEvent::builder()
+                .name(mark.name)
+                .parent_uuid(params.handle.uuid)
+                .timestamp(timestamp)
+                .data_opt(mark.data)
+                .data_schema_opt(mark.data_schema)
+                .metadata_opt(metadata)
+                .build(),
+            mark.category,
+            mark.category_profile,
+        )));
+    }
     let event_sanitizers = snapshot_event_sanitizers(&event, &scope_stack).unwrap_or_default();
     let tool_name = params.handle.name.clone();
     let ToolExecutionResult { result, annotation } = params.execution_result;
