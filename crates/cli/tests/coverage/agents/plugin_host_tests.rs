@@ -4033,6 +4033,70 @@ fn claude_provider_enable_and_restore_preserve_symlinked_settings_path() {
     assert_eq!(json_env_string(&restored, "OTHER"), Some("kept"));
 }
 
+#[cfg(unix)]
+#[test]
+fn claude_enable_does_not_follow_symlinked_backup_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let settings_path = claude_settings_path().unwrap();
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    fs::write(
+        &settings_path,
+        serde_json::to_vec_pretty(&json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": DEFAULT_URL
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let unrelated_target = dir.path().join("unrelated-backup-target.json");
+    fs::write(&unrelated_target, br#"{"sentinel":"keep"}"#).unwrap();
+    let backup = backup_path(&settings_path);
+    symlink(&unrelated_target, &backup).unwrap();
+
+    enable_claude_provider(DEFAULT_URL).unwrap();
+
+    let unrelated: Value =
+        serde_json::from_str(&fs::read_to_string(&unrelated_target).unwrap()).unwrap();
+    assert_eq!(unrelated, json!({"sentinel": "keep"}));
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_restore_absent_original_does_not_delete_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let settings_path = claude_settings_path().unwrap();
+
+    enable_claude_provider(DEFAULT_URL).unwrap();
+    assert!(backup_path(&settings_path).exists());
+
+    fs::remove_file(&settings_path).unwrap();
+    let target = dir.path().join("user-owned-settings.json");
+    fs::write(
+        &target,
+        serde_json::to_vec_pretty(&json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": DEFAULT_URL
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    symlink(&target, &settings_path).unwrap();
+
+    restore_claude_provider(DEFAULT_URL).unwrap();
+
+    assert!(target.exists());
+    assert!(fs::symlink_metadata(&settings_path).is_err());
+}
+
 #[test]
 fn plugin_host_entrypoints_report_json() {
     let dir = tempdir().unwrap();

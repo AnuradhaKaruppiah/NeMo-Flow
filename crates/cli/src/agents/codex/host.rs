@@ -20,9 +20,11 @@ use crate::hooks::generated_hooks;
 use crate::hooks::merge_hooks;
 
 use super::app_server::{CodexAppServerClient, CodexHookMetadata, CodexHooksClient};
+#[cfg(test)]
+use crate::agents::shared::host::write_json;
 use crate::agents::shared::host::{
     atomic_write_private, current_exe, ensure_table, home_dir, read_json_object, shell_quote,
-    write_json,
+    write_json_preserving_symlink,
 };
 use crate::filesystem::{
     FileSnapshot, atomic_write_preserving_symlink, atomic_write_private_preserving_symlink, backup,
@@ -1271,7 +1273,7 @@ pub(crate) fn remove_legacy_codex_hooks(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     backup(path)?;
-    write_json(path, &updated)
+    write_json_preserving_symlink(path, &updated)
 }
 
 #[cfg(test)]
@@ -1314,7 +1316,7 @@ pub(crate) fn uninstall_codex_hooks(path: &Path, _gateway_url: &str) -> Result<b
         remove_file_preserving_symlink(path)?;
         remove_backup(path)?;
     } else {
-        write_json(path, &value)?;
+        write_json_preserving_symlink(path, &value)?;
     }
     Ok(has_remaining_hooks)
 }

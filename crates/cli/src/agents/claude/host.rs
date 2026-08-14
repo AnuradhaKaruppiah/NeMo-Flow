@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::agents::shared::host::{home_dir, read_json_object, write_json};
+use crate::agents::shared::host::{
+    home_dir, read_json_object, write_json, write_json_preserving_symlink,
+};
 use crate::filesystem::{
-    FileSnapshot, backup, backup_path, remove_backup, remove_file_preserving_symlink,
-    restore_file_snapshot, snapshot_optional_file,
+    FileSnapshot, backup, backup_path, remove_backup, restore_file_snapshot, snapshot_optional_file,
 };
 
 const ABSENT_SETTINGS_BACKUP_KEY: &str = "__nemo_relay_original_settings_absent";
@@ -80,7 +81,7 @@ pub(crate) fn enable_claude_provider(gateway_url: &str) -> Result<(), String> {
         .or_insert_with(|| json!({}));
     let env = env.as_object_mut().expect("env was validated as an object");
     env.insert("ANTHROPIC_BASE_URL".into(), json!(gateway_url));
-    if let Err(error) = write_json(&path, &settings) {
+    if let Err(error) = write_json_preserving_symlink(&path, &settings) {
         restore_file_snapshot(&backup_snapshot)?;
         return Err(error);
     }
@@ -114,9 +115,15 @@ pub(crate) fn restore_claude_provider(gateway_url: &str) -> Result<(), String> {
         if backup_settings.get(ABSENT_SETTINGS_BACKUP_KEY) == Some(&Value::Bool(true))
             && settings.as_object().is_some_and(serde_json::Map::is_empty)
         {
-            remove_file_preserving_symlink(&path)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("failed to remove {}: {error}", path.display()));
+                }
+            }
         } else {
-            write_json(&path, &settings)?;
+            write_json_preserving_symlink(&path, &settings)?;
         }
         remove_backup(&path)?;
         println!(
