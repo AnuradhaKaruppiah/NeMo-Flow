@@ -234,3 +234,11 @@ fn create_symlink(target: &Path, path: &Path) -> Result<(), String> {
     std::os::windows::fs::symlink_file(target, path)
         .map_err(|error| format!("failed to create symlink {}: {error}", path.display()))
 }
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink(_target: &Path, path: &Path) -> Result<(), String> {
+    Err(format!(
+        "failed to create symlink {}: unsupported platform",
+        path.display()
+    ))
+}
