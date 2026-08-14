@@ -4173,6 +4173,42 @@ fn claude_restore_absent_original_does_not_delete_symlink_target() {
     assert!(fs::symlink_metadata(&settings_path).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn claude_restore_absent_dangling_symlink_preserves_link_and_removes_created_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let settings_path = claude_settings_path().unwrap();
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+    let target = dir.path().join("missing-target.json");
+    symlink(&target, &settings_path).unwrap();
+    assert!(
+        fs::symlink_metadata(&settings_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&settings_path).unwrap(), target);
+    assert!(!target.exists());
+
+    enable_claude_provider(DEFAULT_URL).unwrap();
+    assert!(target.exists());
+
+    restore_claude_provider(DEFAULT_URL).unwrap();
+
+    assert!(
+        fs::symlink_metadata(&settings_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&settings_path).unwrap(), target);
+    assert!(!target.exists());
+}
+
 #[test]
 fn plugin_host_entrypoints_report_json() {
     let dir = tempdir().unwrap();
