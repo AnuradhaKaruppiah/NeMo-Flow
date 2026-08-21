@@ -200,6 +200,40 @@ pub(crate) fn safe_middleware_callback(env: &Env, func: &JsFunction) -> napi::Re
     Ok(unsafe { wrapper_unknown.cast::<JsFunction>() })
 }
 
+/// Wrap a conditional registration gate so throws and invalid return values
+/// cross N-API as a JSON-compatible error envelope.
+pub(crate) fn safe_conditional_gate_callback(
+    env: &Env,
+    func: &JsFunction,
+) -> napi::Result<JsFunction> {
+    let factory: JsFunction = env.run_script(
+        r#"((fn) => function __nemo_relay_conditional_gate_wrapper(...args) {
+  try {
+    const returned = fn(...args);
+    const value = returned === undefined ? null : returned;
+    if (value === null || typeof value === 'string') {
+      return { ok: true, value };
+    }
+    return { ok: false, error: 'conditional middleware guardrail must return a string or null' };
+  } catch (error) {
+    let message = 'JavaScript callback threw';
+    try {
+      message = String(error?.message ?? error);
+    } catch {}
+    let exceptionType = 'Error';
+    try {
+      const name = String(error?.name ?? '').trim();
+      if (name) exceptionType = name;
+    } catch {}
+    return { ok: false, error: message, exceptionType };
+  }
+})"#,
+    )?;
+    let func_unknown = unsafe { JsUnknown::from_raw_unchecked(env.raw(), func.raw()) };
+    let wrapper_unknown = factory.call(None, &[func_unknown])?;
+    Ok(unsafe { wrapper_unknown.cast::<JsFunction>() })
+}
+
 /// Wrap a synchronous execution callback so failures cross the N-API boundary as data.
 ///
 /// The return value is validated before NAPI-RS attempts to convert it to JSON. This
