@@ -67,7 +67,7 @@ use nemo_relay::plugin::{
     clear_plugin_configuration as clear_plugin_configuration_impl,
     deregister_plugin as deregister_plugin_impl, initialize_plugins as initialize_plugins_impl,
     list_plugin_kinds as list_plugin_kinds_impl, register_plugin as register_plugin_impl,
-    validate_plugin_config as validate_plugin_config_impl,
+    rollback_registrations, validate_plugin_config as validate_plugin_config_impl,
 };
 use nemo_relay::shared_runtime::initialize_shared_runtime_binding;
 use nemo_relay_adaptive::acg::{
@@ -887,6 +887,69 @@ fn build_plugin_context(
 ) -> napi::Result<JsObject> {
     let mut context = env.create_object()?;
 
+    let conditional_gate_regs = registrations.clone();
+    let conditional_gate_namespace = namespace_prefix.clone();
+    let register_conditional_gate = env.create_function_from_closure(
+        "__nemo_relay_plugin_register_conditional_middleware_guardrail",
+        move |ctx| {
+            let name = format!(
+                "{}{}",
+                conditional_gate_namespace,
+                ctx.get::<String>(0)?
+            );
+            let kinds = ctx
+                .get::<Vec<RuntimeRegistrationKind>>(1)?
+                .into_iter()
+                .map(Into::into)
+                .collect::<BTreeSet<_>>();
+            let registration_name = ctx.get::<String>(2)?;
+            let guardrail = ctx.get::<JsFunction>(3)?;
+            let callback = node_conditional_middleware_guardrail(ctx.env, &guardrail)?;
+            core_registry_api::register_conditional_middleware_guardrail(
+                &name,
+                kinds,
+                &registration_name,
+                Arc::new(move |kinds, effective_name| {
+                    callback
+                        .call(
+                            kinds.iter().map(|kind| kind.as_str().to_string()).collect(),
+                            effective_name.to_string(),
+                        )
+                        .unwrap_or_else(|error| {
+                            record_callback_error(format!(
+                                "Node conditional middleware guardrail failed open: {error}"
+                            ));
+                            None
+                        })
+                }),
+            )
+            .map_err(to_napi_err)?;
+
+            let name_clone = name.clone();
+            conditional_gate_regs
+                .lock()
+                .unwrap()
+                .push(PluginRegistration::new(
+                    "plugin",
+                    name_clone.clone(),
+                    Box::new(move || {
+                        core_registry_api::deregister_conditional_middleware_guardrail(&name_clone)
+                            .map(|_| ())
+                            .map_err(|error| {
+                                PluginError::RegistrationFailed(format!(
+                                    "conditional middleware guardrail deregistration failed: {error}"
+                                ))
+                            })
+                    }),
+                ));
+            ctx.env.get_undefined()
+        },
+    )?;
+    context.set_named_property(
+        "registerConditionalMiddlewareGuardrail",
+        register_conditional_gate,
+    )?;
+
     let subscriber_regs = registrations.clone();
     let subscriber_namespace = namespace_prefix.clone();
     let register_subscriber = env.create_function_from_closure(
@@ -1703,6 +1766,37 @@ impl NodeConditionalMiddlewareGuardrail {
     }
 }
 
+fn node_conditional_middleware_guardrail(
+    env: &Env,
+    guardrail: &JsFunction,
+) -> napi::Result<Arc<NodeConditionalMiddlewareGuardrail>> {
+    let guardrail = callable::safe_conditional_gate_callback(env, guardrail)?;
+    let direct = PersistentJsFunction::new(env, &guardrail)?;
+    let registration_thread = std::thread::current().id();
+    let mut thread_safe = guardrail.create_threadsafe_function(
+        0,
+        |ctx: napi::threadsafe_function::ThreadSafeCallContext<(Vec<String>, String)>| {
+            let kinds = unsafe {
+                JsUnknown::from_raw_unchecked(
+                    ctx.env.raw(),
+                    Vec::<String>::to_napi_value(ctx.env.raw(), ctx.value.0)?,
+                )
+            };
+            let registration_name = ctx.env.create_string_from_std(ctx.value.1)?;
+            Ok(vec![
+                kinds,
+                js_unknown_from_raw(&ctx.env, &registration_name),
+            ])
+        },
+    )?;
+    thread_safe.unref(env)?;
+    Ok(Arc::new(NodeConditionalMiddlewareGuardrail {
+        direct,
+        thread_safe,
+        registration_thread,
+    }))
+}
+
 #[cfg(test)]
 mod conditional_gate_tests {
     use super::*;
@@ -1919,23 +2013,37 @@ impl Plugin for NodePlugin {
             let status = self.register.call_with_return_value(
                 payload,
                 ThreadsafeFunctionCallMode::NonBlocking,
-                move |_val: JsUnknown| {
-                    let _ = tx.send(Ok(()));
+                move |value: Json| {
+                    let result = callable::unwrap_middleware_result(
+                        callback_json(Some(value)),
+                        "JS plugin register callback failed",
+                    )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                    let _ = tx.send(result);
                     Ok(())
                 },
             );
-            if status != napi::Status::Ok {
-                return Err(PluginError::RegistrationFailed(format!(
+            let result = if status != napi::Status::Ok {
+                Err(PluginError::RegistrationFailed(format!(
                     "failed to queue JS plugin register callback: {status:?}"
-                )));
+                )))
+            } else {
+                rx.recv()
+                    .map_err(|_| {
+                        PluginError::RegistrationFailed(
+                            "JS plugin register completion channel closed".into(),
+                        )
+                    })?
+                    .map_err(PluginError::RegistrationFailed)
+            };
+            if let Err(error) = result {
+                let mut registrations = registrations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                rollback_registrations(&mut registrations);
+                return Err(error);
             }
-            rx.recv()
-                .map_err(|_| {
-                    PluginError::RegistrationFailed(
-                        "JS plugin register completion channel closed".into(),
-                    )
-                })?
-                .map_err(PluginError::RegistrationFailed)?;
 
             let drained = std::mem::take(&mut *registrations.lock().map_err(|e| {
                 PluginError::RegistrationFailed(format!("plugin registrations lock poisoned: {e}"))
@@ -3465,31 +3573,7 @@ pub fn register_conditional_middleware_guardrail(
     guardrail: JsFunction,
 ) -> Result<()> {
     let selected = kinds.into_iter().map(Into::into).collect::<BTreeSet<_>>();
-    let guardrail = callable::safe_conditional_gate_callback(&env, &guardrail)?;
-    let direct = PersistentJsFunction::new(&env, &guardrail)?;
-    let registration_thread = std::thread::current().id();
-    let mut thread_safe = guardrail.create_threadsafe_function(
-        0,
-        |ctx: napi::threadsafe_function::ThreadSafeCallContext<(Vec<String>, String)>| {
-            let kinds = unsafe {
-                JsUnknown::from_raw_unchecked(
-                    ctx.env.raw(),
-                    Vec::<String>::to_napi_value(ctx.env.raw(), ctx.value.0)?,
-                )
-            };
-            let registration_name = ctx.env.create_string_from_std(ctx.value.1)?;
-            Ok(vec![
-                kinds,
-                js_unknown_from_raw(&ctx.env, &registration_name),
-            ])
-        },
-    )?;
-    thread_safe.unref(&env)?;
-    let callback = Arc::new(NodeConditionalMiddlewareGuardrail {
-        direct,
-        thread_safe,
-        registration_thread,
-    });
+    let callback = node_conditional_middleware_guardrail(&env, &guardrail)?;
     core_registry_api::register_conditional_middleware_guardrail(
         &name,
         selected,
@@ -5668,6 +5752,7 @@ pub fn register_plugin(
         }
         None => None,
     };
+    let register = callable::safe_middleware_callback(&env, &register)?;
     let mut register_tsfn = register
         .create_threadsafe_function::<NodePluginRegisterCall, JsUnknown, _, ErrorStrategy::Fatal>(
             0,
