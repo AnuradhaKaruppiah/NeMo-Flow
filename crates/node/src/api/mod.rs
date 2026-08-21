@@ -78,6 +78,8 @@ use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_adaptive::{AdaptiveConfig, AdaptiveRuntime as CoreAdaptiveRuntime};
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
 
+pub(crate) const LLM_STREAM_BRIDGE_CAPACITY: usize = 32;
+
 use crate::callable;
 use crate::callback_factory;
 use crate::convert::{
@@ -575,6 +577,24 @@ async fn forward_stream_to_channel(
     closed.send_replace(Some(
         stream.close().await.map_err(|error| error.to_string()),
     ));
+}
+
+pub(crate) fn llm_stream_from_rust_stream(rust_stream: RustJsonStream) -> LlmStream {
+    let (tx, rx) = tokio::sync::mpsc::channel(LLM_STREAM_BRIDGE_CAPACITY);
+    let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+    let (closed, closed_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(forward_stream_to_channel(
+        rust_stream,
+        tx,
+        cancel_rx,
+        closed,
+    ));
+    LlmStream {
+        receiver: tokio::sync::Mutex::new(rx),
+        cancel,
+        closed: closed_rx,
+        codec_references: Vec::new(),
+    }
 }
 
 struct NodePushStream {
@@ -3613,7 +3633,7 @@ pub fn deregister_llm_execution_intercept(name: String) -> Result<bool> {
 ///
 /// The `callable` receives the request and a `next` function. Call `next(request)` to
 /// invoke the next intercept or original streaming implementation; in Node the
-/// returned promise resolves to an array of downstream JSON chunks. Skip calling
+/// returned promise resolves to a lazy `AsyncIterable`. Return it directly or wrap it
 /// `next` to short-circuit the chain. `next` may be called repeatedly or concurrently
 /// while `callable` is pending; each call receives an isolated scope-stack branch,
 /// and unfinished or later calls reject after the returned interceptor stream settles.
@@ -3624,7 +3644,7 @@ pub fn register_llm_stream_execution_intercept(
     name: String,
     priority: i32,
     #[napi(
-        ts_arg_type = "(request: Json, next: (request: Json) => Promise<Json[]>) => Json | Json[] | Promise<Json | Json[]>"
+        ts_arg_type = "(request: Json, next: (request: Json) => Promise<AsyncIterable<Json>>) => AsyncIterable<Json> | Promise<AsyncIterable<Json>>"
     )]
     callable: JsFunction,
 ) -> Result<()> {
@@ -4271,7 +4291,7 @@ pub fn scope_deregister_llm_execution_intercept(scope_uuid: String, name: String
 ///
 /// The `callable` receives the request and a `next` function. Call `next(request)` to
 /// invoke the next intercept or original streaming implementation; in Node the
-/// returned promise resolves to an array of downstream JSON chunks. Skip calling
+/// returned promise resolves to a lazy `AsyncIterable`. Return it directly or wrap it
 /// `next` to short-circuit the chain. `next` may be called repeatedly or concurrently
 /// while `callable` is pending; each call receives an isolated scope-stack branch,
 /// and unfinished or later calls reject after the returned interceptor stream settles.
@@ -4283,7 +4303,7 @@ pub fn scope_register_llm_stream_execution_intercept(
     name: String,
     priority: i32,
     #[napi(
-        ts_arg_type = "(request: Json, next: (request: Json) => Promise<Json[]>) => Json | Json[] | Promise<Json | Json[]>"
+        ts_arg_type = "(request: Json, next: (request: Json) => Promise<AsyncIterable<Json>>) => AsyncIterable<Json> | Promise<AsyncIterable<Json>>"
     )]
     callable: JsFunction,
 ) -> Result<()> {
