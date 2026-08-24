@@ -1987,6 +1987,107 @@ async fn classified_tool_repeat_is_a_hit_that_skips_the_tool() {
 }
 
 #[tokio::test]
+async fn unclassified_tool_calls_emit_uncacheable_bypasses_and_run_live() {
+    let _guard = TEST_MUTEX.lock().await;
+    reset_global();
+    activate_cache(cache_with_tools(one_cacheable_class(&["docs_lookup"]))).await;
+
+    let captured = Arc::new(StdMutex::new(Vec::<Event>::new()));
+    let sink = Arc::clone(&captured);
+    let (bypass_tx, bypass_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bypass_rx = Arc::new(Mutex::new(bypass_rx));
+    register_subscriber(
+        "response_cache_unclassified_tool_capture",
+        Arc::new(move |event: &Event| {
+            if event.name() == "response_cache"
+                && event
+                    .data()
+                    .and_then(|data| data.get("status"))
+                    .and_then(Json::as_str)
+                    == Some("bypass")
+                && event
+                    .metadata()
+                    .and_then(|metadata| metadata.get("nemo_relay.response_cache.reason"))
+                    .and_then(Json::as_str)
+                    == Some("uncacheable")
+                && event
+                    .metadata()
+                    .and_then(|metadata| metadata.get("nemo_relay.response_cache.surface"))
+                    .and_then(Json::as_str)
+                    == Some("tool")
+            {
+                let _ = bypass_tx.send(());
+            }
+            sink.lock().unwrap().push(event.clone());
+        }),
+    )
+    .unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool: ToolExecutionNextFn = {
+        let calls = Arc::clone(&calls);
+        let bypass_rx = Arc::clone(&bypass_rx);
+        Arc::new(move |_args: Json| {
+            let calls = Arc::clone(&calls);
+            let bypass_rx = Arc::clone(&bypass_rx);
+            Box::pin(async move {
+                let mut bypass_rx = bypass_rx.lock().await;
+                let bypass_seen =
+                    tokio::time::timeout(Duration::from_secs(1), bypass_rx.recv()).await;
+                assert!(
+                    matches!(bypass_seen, Ok(Some(()))),
+                    "the matching bypass mark must be queued before the live callback starts"
+                );
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"written": "pizza"}).into())
+            })
+        })
+    };
+
+    tool_call("write_order", &tool, json!({"item": "pizza"})).await;
+    tool_call("write_order", &tool, json!({"item": "pizza"})).await;
+    flush_subscribers().unwrap();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "an unclassified tool must run live on every call"
+    );
+    let events = captured.lock().unwrap();
+    let cache_marks: Vec<_> = events
+        .iter()
+        .filter(|event| event.name() == "response_cache")
+        .map(|event| {
+            (
+                event
+                    .data()
+                    .and_then(|data| data.get("status"))
+                    .and_then(Json::as_str),
+                event
+                    .metadata()
+                    .and_then(|metadata| metadata.get("nemo_relay.response_cache.reason"))
+                    .and_then(Json::as_str),
+                event
+                    .metadata()
+                    .and_then(|metadata| metadata.get("nemo_relay.response_cache.surface"))
+                    .and_then(Json::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        cache_marks,
+        vec![
+            (Some("bypass"), Some("uncacheable"), Some("tool")),
+            (Some("bypass"), Some("uncacheable"), Some("tool")),
+        ],
+        "each unclassified call must emit exactly one ordered bypass decision"
+    );
+
+    drop(events);
+    deregister_subscriber("response_cache_unclassified_tool_capture").unwrap();
+}
+
+#[tokio::test]
 async fn an_effectful_class_is_never_cached() {
     let _guard = TEST_MUTEX.lock().await;
     reset_global();
@@ -2208,6 +2309,21 @@ async fn tool_hit_emits_a_surface_tool_mark_with_saved_invocations() {
     flush_subscribers().unwrap();
 
     let events = captured.lock().unwrap();
+    let cache_statuses: Vec<_> = events
+        .iter()
+        .filter(|event| event.name() == "response_cache")
+        .filter_map(|event| {
+            event
+                .data()
+                .and_then(|data| data.get("status"))
+                .and_then(Json::as_str)
+        })
+        .collect();
+    assert_eq!(
+        cache_statuses,
+        vec!["miss", "hit"],
+        "a cacheable repeat must emit one miss followed by one hit"
+    );
     let hit_mark = events
         .iter()
         .find(|event| {
