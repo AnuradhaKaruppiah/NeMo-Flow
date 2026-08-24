@@ -17,7 +17,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -63,7 +63,8 @@ use uuid::Uuid;
 
 use crate::plugin::OTEL_RUNTIME_DELIVERY_FAILURE_MARKER;
 
-pub(super) const COMPLETED_SPAN_CONTEXT_LIMIT: usize = 4096;
+/// Default period for attaching late marks to a completed scope's trace span.
+pub const DEFAULT_COMPLETED_SPAN_CONTEXT_TTL: Duration = Duration::from_secs(60);
 
 use opentelemetry_otlp::WithTonicConfig;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
@@ -250,6 +251,7 @@ pub struct OpenTelemetryConfig {
     max_queue_size: Option<usize>,
     max_export_batch_size: Option<usize>,
     scheduled_delay: Option<Duration>,
+    completed_span_context_ttl: Duration,
 }
 
 impl OpenTelemetryConfig {
@@ -272,6 +274,7 @@ impl OpenTelemetryConfig {
             max_queue_size: None,
             max_export_batch_size: None,
             scheduled_delay: None,
+            completed_span_context_ttl: DEFAULT_COMPLETED_SPAN_CONTEXT_TTL,
         }
     }
 
@@ -367,6 +370,15 @@ impl OpenTelemetryConfig {
         self
     }
 
+    /// Sets how long completed scopes retain their trace context for late marks.
+    ///
+    /// The value must be greater than zero. Subscriber construction fails with
+    /// [`OpenTelemetryError::ExporterBuild`] when the TTL is zero.
+    pub fn with_completed_span_context_ttl(mut self, ttl: Duration) -> Self {
+        self.completed_span_context_ttl = ttl;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn batch_overrides(&self) -> (Option<usize>, Option<usize>, Option<Duration>) {
         (
@@ -374,6 +386,11 @@ impl OpenTelemetryConfig {
             self.max_export_batch_size,
             self.scheduled_delay,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_span_context_ttl(&self) -> Duration {
+        self.completed_span_context_ttl
     }
 
     /// Sets the service namespace resource attribute.
@@ -465,6 +482,8 @@ pub struct OpenTelemetrySubscriberOptions {
     pub attribute_mappings: Vec<OtlpAttributeMapping>,
     /// Literal Event metadata prefixes copied to OTLP attributes.
     pub promote_metadata_prefixes: Vec<String>,
+    /// How long completed scopes retain their trace context for late marks.
+    pub completed_span_context_ttl: Duration,
 }
 
 impl Default for OpenTelemetrySubscriberOptions {
@@ -474,6 +493,7 @@ impl Default for OpenTelemetrySubscriberOptions {
             mark_exclude_names: default_mark_exclude_names(),
             attribute_mappings: Vec::new(),
             promote_metadata_prefixes: Vec::new(),
+            completed_span_context_ttl: DEFAULT_COMPLETED_SPAN_CONTEXT_TTL,
         }
     }
 }
@@ -528,6 +548,11 @@ impl OpenTelemetrySubscriber {
                 "endpoint must be a nonblank string".to_string(),
             ));
         }
+        if config.completed_span_context_ttl.is_zero() {
+            return Err(OpenTelemetryError::ExporterBuild(
+                "completed_span_context_ttl must be greater than 0".to_string(),
+            ));
+        }
         validate_attribute_mappings(&config.attribute_mappings)
             .map_err(OpenTelemetryError::InvalidAttributeMappings)?;
         validate_metadata_promotion_prefixes(&config.promote_metadata_prefixes)
@@ -545,6 +570,7 @@ impl OpenTelemetrySubscriber {
             config.mark_exclude_names,
             config.attribute_mappings,
             config.promote_metadata_prefixes,
+            config.completed_span_context_ttl,
             Some(runtime),
         ))
     }
@@ -576,6 +602,7 @@ impl OpenTelemetrySubscriber {
             default_mark_exclude_names(),
             Vec::new(),
             Vec::new(),
+            DEFAULT_COMPLETED_SPAN_CONTEXT_TTL,
             None,
         )
     }
@@ -610,6 +637,11 @@ impl OpenTelemetrySubscriber {
             .map_err(OpenTelemetryError::InvalidAttributeMappings)?;
         validate_metadata_promotion_prefixes(&options.promote_metadata_prefixes)
             .map_err(OpenTelemetryError::InvalidMetadataPromotionPrefixes)?;
+        if options.completed_span_context_ttl.is_zero() {
+            return Err(OpenTelemetryError::ExporterBuild(
+                "completed_span_context_ttl must be greater than 0".to_string(),
+            ));
+        }
         Ok(Self::from_tracer_provider_with_scope_and_type(
             provider,
             instrumentation_scope.into(),
@@ -618,6 +650,7 @@ impl OpenTelemetrySubscriber {
             options.mark_exclude_names,
             options.attribute_mappings,
             options.promote_metadata_prefixes,
+            options.completed_span_context_ttl,
             None,
         ))
     }
@@ -633,6 +666,11 @@ impl OpenTelemetrySubscriber {
             .map_err(OpenTelemetryError::InvalidAttributeMappings)?;
         validate_metadata_promotion_prefixes(&options.promote_metadata_prefixes)
             .map_err(OpenTelemetryError::InvalidMetadataPromotionPrefixes)?;
+        if options.completed_span_context_ttl.is_zero() {
+            return Err(OpenTelemetryError::ExporterBuild(
+                "completed_span_context_ttl must be greater than 0".to_string(),
+            ));
+        }
         Ok(Self::from_tracer_provider_with_scope_and_type(
             provider,
             instrumentation_scope.into(),
@@ -641,6 +679,7 @@ impl OpenTelemetrySubscriber {
             options.mark_exclude_names,
             options.attribute_mappings,
             options.promote_metadata_prefixes,
+            options.completed_span_context_ttl,
             None,
         ))
     }
@@ -654,6 +693,7 @@ impl OpenTelemetrySubscriber {
         mark_exclude_names: Vec<String>,
         attribute_mappings: Vec<OtlpAttributeMapping>,
         promote_metadata_prefixes: Vec<String>,
+        completed_span_context_ttl: Duration,
         runtime: Option<ExporterRuntime>,
     ) -> Self {
         let runtime_diagnostics = runtime
@@ -661,7 +701,7 @@ impl OpenTelemetrySubscriber {
             .map(|runtime| runtime.runtime_diagnostics.clone())
             .unwrap_or_else(|| SignalRuntimeDiagnostics::new(None));
         let processor = Arc::new(Mutex::new(
-            OtelEventProcessor::new_with_mark_projection_and_exclusions_and_mappings_and_runtime_diagnostics(
+            OtelEventProcessor::new_with_mark_projection_and_exclusions_and_mappings_and_runtime_diagnostics_with_ttl(
                 provider.clone(),
                 instrumentation_scope,
                 otel_type,
@@ -669,6 +709,7 @@ impl OpenTelemetrySubscriber {
                 mark_exclude_names,
                 attribute_mappings,
                 promote_metadata_prefixes,
+                completed_span_context_ttl,
                 runtime_diagnostics.clone(),
             ),
         ));
@@ -1155,8 +1196,8 @@ pub(super) struct ActiveSpan {
 
 pub(super) struct OtelEventProcessor {
     pub(super) active_spans: HashMap<Uuid, ActiveSpan>,
-    pub(super) completed_span_contexts: HashMap<Uuid, SpanContext>,
-    pub(super) completed_span_order: VecDeque<Uuid>,
+    pub(super) completed_span_contexts: HashMap<Uuid, CompletedSpanContext>,
+    pub(super) completed_span_expiry_index: BTreeMap<DateTime<Utc>, HashSet<Uuid>>,
     #[cfg(test)]
     provider: SdkTracerProvider,
     tracer: SdkTracer,
@@ -1166,7 +1207,14 @@ pub(super) struct OtelEventProcessor {
     attribute_mappings: Vec<OtlpAttributeMapping>,
     promote_metadata_prefixes: Vec<String>,
     invalid_metric_count: u64,
+    completed_span_context_ttl: Duration,
     runtime_diagnostics: SignalRuntimeDiagnostics,
+}
+
+#[derive(Clone)]
+pub(super) struct CompletedSpanContext {
+    closed_at: DateTime<Utc>,
+    span_context: SpanContext,
 }
 
 impl OtelEventProcessor {
@@ -1275,8 +1323,9 @@ impl OtelEventProcessor {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    fn new_with_mark_projection_and_exclusions_and_mappings_and_runtime_diagnostics(
+    pub(super) fn new_with_mark_projection_and_exclusions_and_mappings_and_runtime_diagnostics(
         provider: SdkTracerProvider,
         instrumentation_scope: String,
         otel_type: OpenTelemetryType,
@@ -1286,11 +1335,36 @@ impl OtelEventProcessor {
         promote_metadata_prefixes: Vec<String>,
         runtime_diagnostics: SignalRuntimeDiagnostics,
     ) -> Self {
+        Self::new_with_mark_projection_and_exclusions_and_mappings_and_runtime_diagnostics_with_ttl(
+            provider,
+            instrumentation_scope,
+            otel_type,
+            mark_projection,
+            mark_exclude_names,
+            attribute_mappings,
+            promote_metadata_prefixes,
+            DEFAULT_COMPLETED_SPAN_CONTEXT_TTL,
+            runtime_diagnostics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_mark_projection_and_exclusions_and_mappings_and_runtime_diagnostics_with_ttl(
+        provider: SdkTracerProvider,
+        instrumentation_scope: String,
+        otel_type: OpenTelemetryType,
+        mark_projection: MarkProjection,
+        mark_exclude_names: Vec<String>,
+        attribute_mappings: Vec<OtlpAttributeMapping>,
+        promote_metadata_prefixes: Vec<String>,
+        completed_span_context_ttl: Duration,
+        runtime_diagnostics: SignalRuntimeDiagnostics,
+    ) -> Self {
         let tracer = provider.tracer(instrumentation_scope);
         Self {
             active_spans: HashMap::new(),
             completed_span_contexts: HashMap::new(),
-            completed_span_order: VecDeque::new(),
+            completed_span_expiry_index: BTreeMap::new(),
             #[cfg(test)]
             provider,
             tracer,
@@ -1300,11 +1374,13 @@ impl OtelEventProcessor {
             attribute_mappings,
             promote_metadata_prefixes,
             invalid_metric_count: 0,
+            completed_span_context_ttl,
             runtime_diagnostics,
         }
     }
 
     pub(super) fn process(&mut self, event: &Event) {
+        self.expire_completed_span_contexts(*event.timestamp());
         match event.scope_category() {
             Some(ScopeCategory::Start) => self.process_start(event),
             Some(ScopeCategory::End) => self.process_end(event),
@@ -1400,7 +1476,11 @@ impl OtelEventProcessor {
         let Some(mut active_span) = self.active_spans.remove(&event.uuid()) else {
             return;
         };
-        self.record_completed_span_context(event.uuid(), active_span.span_context.clone());
+        self.record_completed_span_context(
+            event.uuid(),
+            *event.timestamp(),
+            active_span.span_context.clone(),
+        );
 
         super::set_span_status_from_event_metadata(&mut active_span.span, event);
         let mut attributes = match self.otel_type {
@@ -1647,7 +1727,7 @@ impl OtelEventProcessor {
             .parent_uuid()
             .and_then(|uuid| self.completed_span_contexts.get(&uuid))
         {
-            return Context::new().with_remote_span_context(span_context.clone());
+            return Context::new().with_remote_span_context(span_context.span_context.clone());
         }
         let Some(parent_uuid) = event.parent_uuid() else {
             return Context::new();
@@ -1685,23 +1765,85 @@ impl OtelEventProcessor {
     }
 
     fn remove_completed_span_context(&mut self, uuid: Uuid) {
-        self.completed_span_contexts.remove(&uuid);
-        self.completed_span_order
-            .retain(|completed_uuid| *completed_uuid != uuid);
+        if let Some(context) = self.completed_span_contexts.remove(&uuid) {
+            self.remove_completed_span_expiry_index_entry(uuid, context.closed_at);
+        }
     }
 
-    fn record_completed_span_context(&mut self, uuid: Uuid, span_context: SpanContext) {
-        if self
-            .completed_span_contexts
-            .insert(uuid, span_context)
-            .is_none()
-        {
-            self.completed_span_order.push_back(uuid);
+    fn remove_completed_span_expiry_index_entry(&mut self, uuid: Uuid, closed_at: DateTime<Utc>) {
+        let remove_bucket = self
+            .completed_span_expiry_index
+            .get_mut(&closed_at)
+            .is_some_and(|uuids| {
+                uuids.remove(&uuid);
+                uuids.is_empty()
+            });
+        if remove_bucket {
+            self.completed_span_expiry_index.remove(&closed_at);
         }
-        while self.completed_span_order.len() > COMPLETED_SPAN_CONTEXT_LIMIT {
-            if let Some(expired) = self.completed_span_order.pop_front() {
-                self.completed_span_contexts.remove(&expired);
+    }
+
+    fn record_completed_span_context(
+        &mut self,
+        uuid: Uuid,
+        closed_at: DateTime<Utc>,
+        span_context: SpanContext,
+    ) {
+        if let Some(previous) = self.completed_span_contexts.insert(
+            uuid,
+            CompletedSpanContext {
+                closed_at,
+                span_context,
+            },
+        ) {
+            self.remove_completed_span_expiry_index_entry(uuid, previous.closed_at);
+        }
+        self.completed_span_expiry_index
+            .entry(closed_at)
+            .or_default()
+            .insert(uuid);
+    }
+
+    fn expire_completed_span_contexts(&mut self, event_timestamp: DateTime<Utc>) {
+        let mut expired_count = 0_u64;
+        while let Some((closed_at, _)) = self.completed_span_expiry_index.first_key_value() {
+            let closed_at = closed_at.to_owned();
+            let expired = event_timestamp
+                .signed_duration_since(closed_at)
+                .to_std()
+                .is_ok_and(|age| age > self.completed_span_context_ttl);
+            if !expired {
+                break;
             }
+            let uuids = self
+                .completed_span_expiry_index
+                .remove(&closed_at)
+                .expect("expiry index entry must exist after lookup");
+            for uuid in uuids {
+                if self.completed_span_contexts.remove(&uuid).is_some() {
+                    expired_count = expired_count.saturating_add(1);
+                }
+            }
+        }
+        if expired_count == 0 {
+            return;
+        }
+        let diagnostic_count = self.runtime_diagnostics.record(
+            "otel.completed_span_context_expired",
+            format!(
+                "OpenTelemetry trace lineage expired {expired_count} completed scope contexts after {} ms",
+                self.completed_span_context_ttl.as_millis()
+            ),
+            expired_count,
+        );
+        if should_relog_runtime_diagnostic(diagnostic_count) {
+            log::warn!(
+                target: "nemo_relay.observability",
+                event = "otel_completed_span_context_expired",
+                expired_count,
+                completed_span_context_ttl_millis = self.completed_span_context_ttl.as_millis();
+                "OpenTelemetry trace lineage expired completed scope contexts"
+            );
         }
     }
 }
