@@ -307,6 +307,17 @@ impl SpanExporter for FailingThenRecoveringSpanExporter {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct SensitiveFailingSpanExporter;
+
+impl SpanExporter for SensitiveFailingSpanExporter {
+    async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+        Err(OTelSdkError::InternalFailure(
+            "Authorization: Bearer exporter-secret".to_string(),
+        ))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AlwaysFailingSpanExporter;
 
@@ -4589,11 +4600,7 @@ fn dropped_spans_are_recorded_in_the_active_plugin_report() {
         diagnostic.field.as_deref(),
         Some("opentelemetry.traces[2].endpoint")
     );
-    assert!(
-        diagnostic
-            .message
-            .contains("https://collector.example/v1/traces")
-    );
+    assert!(diagnostic.message.contains("https://collector.example:443"));
     assert_eq!(
         runtime_diagnostics
             .snapshot()
@@ -4671,12 +4678,8 @@ fn trace_export_failures_are_diagnosed_until_a_later_export_recovers() {
         .get("otel.traces_export_failed")
         .expect("trace export failure diagnostic");
     assert_eq!(diagnostic.count, 1);
-    assert!(
-        diagnostic
-            .message
-            .contains("https://collector.example/v1/traces")
-    );
-    assert!(diagnostic.message.contains("collector unavailable"));
+    assert!(diagnostic.message.contains("https://collector.example:443"));
+    assert!(!diagnostic.message.contains("collector unavailable"));
 
     let repeated_flush = provider.force_flush().unwrap_err();
     assert!(
@@ -4687,6 +4690,71 @@ fn trace_export_failures_are_diagnosed_until_a_later_export_recovers() {
 
     tracer.start("recovery-export").end();
     provider.force_flush().unwrap();
+    provider.shutdown().unwrap();
+}
+
+#[test]
+fn trace_endpoint_log_identity_redacts_and_validates_urls() {
+    for (endpoint, expected) in [
+        ("not a URL", "an invalid OTLP endpoint"),
+        ("ftp://collector.example/secret", "an invalid OTLP endpoint"),
+        (
+            "https://[::1]:4318/private?access_token=url-secret",
+            "https://[::1]:4318",
+        ),
+        (
+            "https://user:password@collector.example:4318/private?access_token=url-secret#fragment-secret",
+            "https://collector.example:4318",
+        ),
+    ] {
+        assert_eq!(trace_endpoint_log_identity(endpoint), expected);
+    }
+}
+
+#[test]
+fn trace_export_failures_use_a_safe_endpoint_identity() {
+    let endpoint = "https://user:password@collector.example:4318/private-path?access_token=url-secret#fragment-secret";
+    let runtime_diagnostics = SignalRuntimeDiagnostics::new(None);
+    let processor = DiagnosticBatchSpanProcessor::new_with_batch_config(
+        SensitiveFailingSpanExporter,
+        endpoint.to_string(),
+        runtime_diagnostics.clone(),
+        BatchConfigBuilder::default()
+            .with_max_export_batch_size(1)
+            .build(),
+    );
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(processor)
+        .build();
+    let tracer = provider.tracer("safe-trace-export-failure-test");
+
+    tracer.start("export-fails").end();
+    let error = provider.force_flush().unwrap_err().to_string();
+    let diagnostic = runtime_diagnostics
+        .snapshot()
+        .get("otel.traces_export_failed")
+        .expect("trace export failure diagnostic")
+        .message
+        .clone();
+
+    for message in [&error, &diagnostic] {
+        assert!(message.contains("https://collector.example:4318"));
+        for secret in [
+            "user",
+            "password",
+            "private-path",
+            "url-secret",
+            "fragment-secret",
+            "exporter-secret",
+            "Authorization",
+        ] {
+            assert!(
+                !message.contains(secret),
+                "trace export failure leaked {secret:?}: {message}"
+            );
+        }
+    }
+
     provider.shutdown().unwrap();
 }
 
@@ -4741,12 +4809,8 @@ fn unrecovered_trace_export_failure_is_retained_in_the_active_plugin_report() {
         diagnostic.field.as_deref(),
         Some("opentelemetry.traces[2].endpoint")
     );
-    assert!(
-        diagnostic
-            .message
-            .contains("https://collector.example/v1/traces")
-    );
-    assert!(diagnostic.message.contains("collector unavailable"));
+    assert!(diagnostic.message.contains("https://collector.example:443"));
+    assert!(!diagnostic.message.contains("collector unavailable"));
 }
 
 #[test]
