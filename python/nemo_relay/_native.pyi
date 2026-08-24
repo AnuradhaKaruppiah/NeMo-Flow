@@ -1150,6 +1150,7 @@ class OpenTelemetryConfig:
     service_version: Optional[str]
     instrumentation_scope: str
     timeout_millis: int
+    completed_span_context_ttl_millis: int
     mark_projection: Literal["inherit", "event", "tool"]
     mark_exclude_names: list[str]
     promote_metadata_prefixes: list[str]
@@ -1253,6 +1254,7 @@ class OpenTelemetryLogConfig:
     max_queue_size: int
     max_export_batch_size: int
     scheduled_delay_millis: int
+    completed_span_context_ttl_millis: int
 
     def __init__(self, endpoint: str) -> None: ...
     @property

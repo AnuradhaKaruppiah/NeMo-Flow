@@ -40,6 +40,7 @@ describe('OpenTelemetrySubscriber', () => {
       serviceVersion: '1.0.0',
       instrumentationScope: 'node-tests',
       timeoutMillis: 1250,
+      completedSpanContextTtlMillis: 4294967296n,
       headers: {
         authorization: 'Bearer token',
       },
@@ -123,6 +124,24 @@ describe('OpenTelemetrySubscriber', () => {
     assert.throws(
       () => new OpenTelemetrySubscriber({ type: 'full', endpoint: ' \t' }),
       /endpoint must be a nonblank string/i,
+    );
+    assert.throws(
+      () =>
+        new OpenTelemetrySubscriber({
+          type: 'full',
+          endpoint: 'http://localhost:4318/v1/traces',
+          completedSpanContextTtlMillis: 0n,
+        }),
+      /completedSpanContextTtlMillis must be greater than 0/i,
+    );
+    assert.throws(
+      () =>
+        new OpenTelemetrySubscriber({
+          type: 'full',
+          endpoint: 'http://localhost:4318/v1/traces',
+          completedSpanContextTtlMillis: -1n,
+        }),
+      /must be a nonnegative u64 BigInt/i,
     );
   });
 
@@ -243,6 +262,10 @@ describe('OpenTelemetry log and metric subscribers', () => {
           maxQueueSize: 0,
         }),
       /max_queue_size must be greater than 0/,
+    );
+    assert.throws(
+      () => new OpenTelemetryLogSubscriber({ endpoint: 'http://localhost:4318', completedSpanContextTtlMillis: 0n }),
+      /completedSpanContextTtlMillis must be greater than 0/i,
     );
     assert.throws(
       () =>
