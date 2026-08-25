@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use serde_json::Value as Json;
 
-use nemo_relay::api::event::{CategoryProfile, Event};
+use nemo_relay::api::event::{
+    CategoryProfile, Event, METRIC_DATA_SCHEMA_NAME, METRIC_DATA_SCHEMA_VERSION, MetricEnvelope,
+};
 use nemo_relay::codec::request::AnnotatedLlmRequest;
 use nemo_relay::codec::response::AnnotatedLlmResponse;
 
@@ -128,6 +130,19 @@ impl TrajectorySanitizer {
         event: &Event,
         mut fields: nemo_relay::api::event::EventSanitizeFields,
     ) -> nemo_relay::api::event::EventSanitizeFields {
+        if is_relay_metric_mark(event) {
+            fields.data = fields
+                .data
+                .and_then(|data| self.sanitize_metric_envelope(data));
+            fields.metadata = fields
+                .metadata
+                .map(|value| redact_semantic_content(value, &self.replacement, None));
+            fields.category_profile = fields
+                .category_profile
+                .and_then(|profile| sanitize_category_profile(profile, &self.replacement));
+            return fields;
+        }
+
         let category = event.category().map(|category| category.as_str());
         let specialized_scope =
             matches!(event, Event::Scope(_)) && matches!(category, Some("llm" | "tool"));
@@ -166,6 +181,59 @@ impl TrajectorySanitizer {
             .category_profile
             .and_then(|profile| sanitize_category_profile(profile, &self.replacement));
         fields
+    }
+
+    /// Redact optional metric text without modifying required export fields.
+    fn sanitize_metric_envelope(&self, data: Json) -> Option<Json> {
+        let mut envelope = serde_json::from_value::<MetricEnvelope>(data).ok()?;
+        envelope.validate().ok()?;
+        for measurement in &mut envelope.measurements {
+            measurement.description = measurement
+                .description
+                .take()
+                .map(|_| (*self.replacement).clone());
+            measurement.attributes = measurement
+                .attributes
+                .take()
+                .map(|attributes| redact_metric_string_attributes(attributes, &self.replacement));
+        }
+        envelope.validate().ok()?;
+        serde_json::to_value(envelope).ok()
+    }
+}
+
+/// Return whether an event carries Relay's typed metric schema.
+pub(crate) fn is_relay_metric_mark(event: &Event) -> bool {
+    matches!(event, Event::Mark(_))
+        && event.data_schema().is_some_and(|schema| {
+            schema.name == METRIC_DATA_SCHEMA_NAME && schema.version == METRIC_DATA_SCHEMA_VERSION
+        })
+}
+
+/// Redact strings in a typed metric attribute object.
+fn redact_metric_string_attributes(value: Json, replacement: &str) -> Json {
+    match value {
+        Json::Object(values) => Json::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, redact_metric_string_attribute(value, replacement)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+/// Redact an individual typed metric attribute when it contains text.
+fn redact_metric_string_attribute(value: Json, replacement: &str) -> Json {
+    match value {
+        Json::String(_) => Json::String(replacement.to_string()),
+        Json::Array(values) if values.iter().all(Json::is_string) => Json::Array(
+            values
+                .into_iter()
+                .map(|_| Json::String(replacement.to_string()))
+                .collect(),
+        ),
+        value => value,
     }
 }
 
