@@ -5207,11 +5207,19 @@ impl OpenTelemetrySubscriber {
     }
 
     /// Force a flush of finished spans through the exporter.
+    ///
+    /// A successful flush updates `runtimeDiagnostics()` with queue drops observed so far.
     #[napi]
     pub fn force_flush(&self) -> napi::Result<()> {
         self.inner
             .force_flush()
             .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Return bounded runtime diagnostics recorded by this subscriber.
+    #[napi(ts_return_type = "Array<{ code: string; message: string; count: number }>")]
+    pub fn runtime_diagnostics(&self) -> Json {
+        otel_runtime_diagnostics_json(self.inner.runtime_diagnostics())
     }
 
     /// Shut down the underlying tracer provider.
@@ -5295,6 +5303,8 @@ impl OpenTelemetryLogSubscriber {
     }
 
     /// Flush queued Relay events and the OTLP log processor.
+    ///
+    /// A successful flush updates `runtimeDiagnostics()` with queue drops observed so far.
     #[napi]
     pub fn force_flush(&self) -> napi::Result<()> {
         self.inner
