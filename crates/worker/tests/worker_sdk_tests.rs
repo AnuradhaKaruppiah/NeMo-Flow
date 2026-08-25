@@ -20,9 +20,9 @@ use futures_util::{Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use nemo_relay_types::api::event::{BaseEvent, Event, MarkEvent, PendingMarkSpec};
 use nemo_relay_worker::{
-    ANNOTATED_LLM_REQUEST_SCHEMA, DataSchema, EmitMarkOptions, Json, JsonStream, LlmNext,
-    LlmRequest, LlmStreamNext, LogSeverity, MetricKind, MetricMeasurement, MetricValueType,
-    PluginContext, PluginRuntime, Result, RuntimeRegistrationKind, ScopeType,
+    ANNOTATED_LLM_REQUEST_SCHEMA, DataSchema, EmitMarkOptions, EventCategory, Json, JsonStream,
+    LlmNext, LlmRequest, LlmStreamNext, LogSeverity, MetricKind, MetricMeasurement,
+    MetricValueType, PluginContext, PluginRuntime, Result, RuntimeRegistrationKind, ScopeType,
     ToolExecutionInterceptOutcome, ToolNext, WorkerPlugin, WorkerSdkError, WorkerServerConfig,
     serve_plugin, serve_plugin_arc, serve_plugin_arc_with_config,
 };
@@ -924,6 +924,7 @@ async fn worker_service_invokes_every_registration_surface() {
         .find(|request| request.name == "tool-exec-telemetry")
         .expect("extended mark request");
     assert_eq!(telemetry_mark.severity, "warn");
+    assert_eq!(telemetry_mark.category, "custom");
     let data_schema = telemetry_mark.data_schema.expect("mark data schema");
     assert_eq!(data_schema.schema, "nemo.relay.DataSchema@1");
     assert_eq!(
@@ -938,6 +939,7 @@ async fn worker_service_invokes_every_registration_surface() {
         .into_iter()
         .find(|request| request.name == "tool-exec-metric")
         .expect("metric mark request");
+    assert_eq!(metric_mark.category, "custom");
     let metric_schema = metric_mark.data_schema.expect("metric data schema");
     assert_eq!(
         decode_json_envelope::<DataSchema>(&metric_schema).unwrap(),
@@ -2075,7 +2077,7 @@ impl WorkerPlugin for SurfacePlugin {
                 }
                 runtime.emit_mark("tool-exec", None, None).await?;
                 runtime
-                    .emit_mark_with_options(
+                    .emit_mark_with_options_and_category(
                         "tool-exec-telemetry",
                         Some(json!({"measurements": []})),
                         None,
@@ -2088,10 +2090,11 @@ impl WorkerPlugin for SurfacePlugin {
                             ),
                             severity: Some(LogSeverity::Warn),
                         },
+                        EventCategory::custom(),
                     )
                     .await?;
                 runtime
-                    .emit_metric(
+                    .emit_metric_with_category(
                         "tool-exec-metric",
                         vec![MetricMeasurement {
                             name: "worker.requests".into(),
@@ -2104,6 +2107,7 @@ impl WorkerPlugin for SurfacePlugin {
                             boundaries: None,
                         }],
                         None,
+                        EventCategory::custom(),
                     )
                     .await?;
                 let stack_id = runtime.create_scope_stack().await?;
