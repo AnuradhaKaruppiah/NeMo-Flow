@@ -166,7 +166,11 @@ marks. Configure only fixed constants or bounded enum values; do not add
 free-form identifiers or user-provided text.
 
 Strings become `[REDACTED]`, numbers become `0`, booleans become `false`, and
-nulls, keys, arrays, and object shape are retained.
+nulls, keys, arrays, and object shape are retained. On every mark, the preset
+preserves the reserved `nemo_relay.log.severity` metadata field in canonical
+form when it contains a supported severity. For opaque custom marks that use
+`redact_all_leaves`, unsupported severity values remain redacted with the
+other string leaves.
 Known Relay marks are sanitized semantically so their structural and analytical
 fields remain usable. This choice affects canonical event fields before
 subscriber fan-out; exporter-owned resource attributes are outside this
