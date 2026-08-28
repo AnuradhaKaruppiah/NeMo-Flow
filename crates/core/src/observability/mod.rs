@@ -40,6 +40,7 @@ pub(crate) fn test_mutex() -> &'static Mutex<()> {
 
 pub mod atif;
 pub mod atof;
+mod confined_fs;
 pub(crate) mod manual;
 pub(crate) mod openinference;
 pub mod otel;
@@ -48,6 +49,7 @@ pub mod otel_logs;
 pub mod otel_metrics;
 mod otel_signal;
 pub mod plugin_component;
+mod private_file;
 
 pub use otel_signal::{OpenTelemetryRuntimeDiagnostic, OpenTelemetryRuntimeDiagnostics};
 

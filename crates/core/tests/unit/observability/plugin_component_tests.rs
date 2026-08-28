@@ -60,7 +60,7 @@ fn temp_dir(prefix: &str) -> PathBuf {
         .as_nanos();
     let path = std::env::temp_dir().join(format!("nemo-relay-{prefix}-{id}"));
     fs::create_dir_all(&path).unwrap();
-    path
+    path.canonicalize().unwrap()
 }
 
 #[cfg(feature = "atof-streaming")]
@@ -2863,7 +2863,7 @@ fn atif_defaults_create_one_file_per_top_level_agent() {
 }
 
 #[test]
-fn atif_filename_template_routes_by_metadata_and_skips_invalid_paths() {
+fn atif_filename_template_sanitizes_metadata_paths() {
     let _guard = crate::observability::test_mutex().lock().unwrap();
     reset_runtime();
     let dir = temp_dir("observability-atif-metadata-template");
@@ -2877,15 +2877,15 @@ fn atif_filename_template_routes_by_metadata_and_skips_invalid_paths() {
     }));
     futures::executor::block_on(initialize_plugins_exact(config)).unwrap();
 
-    let invalid = crate::api::scope::push_scope(
+    let sanitized = crate::api::scope::push_scope(
         PushScopeParams::builder()
-            .name("invalid-metadata-path-agent")
+            .name("sanitized-metadata-path-agent")
             .scope_type(ScopeType::Agent)
             .metadata(json!({"routing": {"artifact_path": "../escape"}}))
             .build(),
     )
     .unwrap();
-    pop(&invalid);
+    pop(&sanitized);
 
     let valid = crate::api::scope::push_scope(
         PushScopeParams::builder()
@@ -2899,31 +2899,19 @@ fn atif_filename_template_routes_by_metadata_and_skips_invalid_paths() {
 
     flush_subscribers().unwrap();
     assert!(
-        crate::plugin::active_plugin_report()
-            .unwrap()
-            .runtime_diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "atif.destination_render_failed")
-    );
-    let teardown = clear_plugin_configuration().unwrap_err();
-    assert!(
-        teardown
-            .to_string()
-            .contains("atif.destination_render_failed")
-    );
-    let invalid_filename = format!("trajectory-{}.json", invalid.uuid);
-    assert!(
-        !dir.join(&invalid_filename).exists()
-            && !dir.join("../escape").join(&invalid_filename).exists(),
-        "unsafe metadata path should not produce a trajectory file"
+        dir.join(format!("-escape/trajectory-{}.json", sanitized.uuid))
+            .exists(),
+        "unsafe metadata groups should be replaced with a dash"
     );
     assert!(
         dir.join(format!(
-            "tenant-a/session-123/trajectory-{}.json",
+            "tenant-a-session-123/trajectory-{}.json",
             valid.uuid
         ))
         .exists()
     );
+
+    clear_plugin_configuration().unwrap();
 
     futures::executor::block_on(initialize_plugins_exact(plugin_config(json!({
         "atif": {
@@ -3379,6 +3367,7 @@ fn write_atif_reports_missing_local_path_and_unregistered_remote_sink() {
         agent_uuid,
         session_id: agent_uuid.to_string(),
         filename: "trajectory.json".into(),
+        local_root: None,
         local_path: None,
         payload: b"{}".to_vec(),
     };
@@ -3410,6 +3399,7 @@ fn write_atif_spills_to_local_when_all_remote_sinks_fail() {
         agent_uuid,
         session_id: agent_uuid.to_string(),
         filename: "trajectory.json".into(),
+        local_root: Some(dir.clone()),
         local_path: Some(path.clone()),
         payload: b"{}".to_vec(),
     };
@@ -3426,14 +3416,97 @@ fn write_atif_spills_to_local_when_all_remote_sinks_fail() {
 #[test]
 fn atif_dispatcher_default_output_path_uses_current_directory() {
     let dispatcher = AtifDispatcher::new(AtifSectionConfig::default());
-    let (filename, local_path) = dispatcher.prepare_destination("session-1", None).unwrap();
+    let (filename, local_root, local_path) =
+        dispatcher.prepare_destination("session-1", None).unwrap();
     assert_eq!(filename, "nemo-relay-atif-session-1.json");
+    assert_eq!(local_root.unwrap(), std::env::current_dir().unwrap());
     assert_eq!(
         local_path.unwrap(),
         std::env::current_dir()
             .unwrap()
             .join("nemo-relay-atif-session-1.json")
     );
+}
+
+#[test]
+fn atif_session_id_cannot_escape_the_output_directory() {
+    let dispatcher = AtifDispatcher::new(AtifSectionConfig::default());
+    for session_id in ["../escape", "/absolute", "nested/../../escape"] {
+        assert!(
+            dispatcher.prepare_destination(session_id, None).is_err(),
+            "unsafe session id should be rejected: {session_id:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn atif_local_write_replaces_regular_files_privately_and_rejects_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().canonicalize().unwrap();
+    let path = dir_path.join("trajectory.json");
+    write_atif_local(&dir_path, &path, b"first").unwrap();
+    write_atif_local(&dir_path, &path, b"second").unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"second");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let target = dir_path.join("target.json");
+    fs::write(&target, b"preserve").unwrap();
+    let link = dir_path.join("link.json");
+    symlink(&target, &link).unwrap();
+    assert!(write_atif_local(&dir_path, &link, b"overwrite").is_err());
+    assert_eq!(fs::read(target).unwrap(), b"preserve");
+
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = outside.path().canonicalize().unwrap();
+    let linked_parent = dir_path.join("linked-parent");
+    symlink(&outside_path, &linked_parent).unwrap();
+    assert!(write_atif_local(&dir_path, &linked_parent.join("escaped.json"), b"escape").is_err());
+    assert!(!outside_path.join("escaped.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn atif_local_write_resolves_symlinked_configured_root() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let parent_path = parent.path().canonicalize().unwrap();
+    let outside_path = outside.path().canonicalize().unwrap();
+    let link = parent_path.join("linked");
+    symlink(&outside_path, &link).unwrap();
+    let root = link.join("atif");
+    let path = root.join("trajectory.json");
+
+    write_atif_local(&root, &path, b"trajectory").unwrap();
+    assert_eq!(
+        fs::read(outside_path.join("atif/trajectory.json")).unwrap(),
+        b"trajectory"
+    );
+}
+
+#[test]
+fn atif_metadata_template_values_are_sanitized() {
+    assert_eq!(sanitize_atif_metadata_fragment("tenant-a"), "tenant-a");
+    assert_eq!(sanitize_atif_metadata_fragment("../tenant/a"), "-tenant-a");
+    assert_eq!(
+        sanitize_atif_metadata_fragment(r"tenant\project"),
+        "tenant-project"
+    );
+    assert_eq!(
+        sanitize_atif_metadata_fragment("tenant / : project"),
+        "tenant-project"
+    );
+    assert_eq!(sanitize_atif_metadata_fragment("run...name"), "run-name");
+    assert_eq!(sanitize_atif_metadata_fragment("ténant///项目"), "t-nant-");
+    assert_eq!(sanitize_atif_metadata_fragment("."), "-");
+    assert_eq!(sanitize_atif_metadata_fragment(".."), "-");
 }
 
 #[test]
@@ -3515,7 +3588,7 @@ fn atif_metadata_template_values_must_be_safe_path_fragments() {
     let destination = nested_dispatcher
         .prepare_destination("session-1", Some(&nested_string))
         .unwrap();
-    assert_eq!(destination.0, "tenant-a/team_1/trajectory-session-1.json");
+    assert_eq!(destination.0, "tenant-a-team_1/trajectory-session-1.json");
 
     for template in [
         "/tmp/trajectory-{session_id}.json",
@@ -3573,6 +3646,7 @@ fn atif_payload_merges_correlation_with_existing_trajectory_extra() {
     let write = prepare_atif_payload(
         agent_uuid,
         format!("trajectory-{agent_uuid}.json"),
+        None,
         None,
         trajectory,
         Vec::new(),

@@ -1099,7 +1099,7 @@ fn cache_error_policy_partitions_tool_keys() {
 
 #[test]
 fn header_allowlist_policy_partitions_keys_and_normalizes_case() {
-    let request = request(json!({
+    let mut request = request(json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "hi"}],
         "temperature": 0.0,
@@ -1123,6 +1123,19 @@ fn header_allowlist_policy_partitions_keys_and_normalizes_case() {
         key_of("openai", &request, &tenant_partitioned),
         key_of("openai", &request, &duplicate_spelling),
         "case-only and duplicate policy spellings are equivalent"
+    );
+
+    request
+        .headers
+        .insert("x-tenant".to_string(), json!("tenant-a"));
+    let tenant_a = key_of("openai", &request, &tenant_partitioned);
+    request
+        .headers
+        .insert("x-tenant".to_string(), json!("tenant-b"));
+    assert_ne!(
+        tenant_a,
+        key_of("openai", &request, &tenant_partitioned),
+        "different allowlisted tenant identities must not share entries"
     );
 }
 
