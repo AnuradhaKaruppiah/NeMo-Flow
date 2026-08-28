@@ -152,7 +152,17 @@ impl Drop for PluginKindCleanup {
 }
 
 fn test_http_client() -> reqwest::Client {
-    reqwest::Client::new()
+    let key = BootstrapChallengeKey::load().expect("test hook credential should load");
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        crate::configuration::BOOTSTRAP_CLIENT_TOKEN_HEADER,
+        reqwest::header::HeaderValue::from_str(&key.client_token())
+            .expect("test hook credential should be a valid header"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("test HTTP client should build")
 }
 
 struct GenericTestPlugin;
@@ -551,6 +561,15 @@ async fn managed_sidecar_requires_private_client_proof_for_forwarded_credentials
             .allow_environment_provider_auth
     );
 
+    let explicit_daemon =
+        AppState::new_with_bootstrap(test_config(), None, Some(key.clone()), false, None, None);
+    assert!(
+        explicit_daemon
+            .authorize_provider_request(&mut HeaderMap::new())
+            .unwrap()
+            .allow_environment_provider_auth
+    );
+
     let transparent = AppState::new_with_bootstrap(
         test_config(),
         Some("transparent-fingerprint".into()),
@@ -577,6 +596,41 @@ async fn managed_sidecar_requires_private_client_proof_for_forwarded_credentials
         !transparent_headers
             .contains_key(crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER)
     );
+}
+
+#[tokio::test]
+async fn explicit_daemon_hook_authentication_is_internal_and_rejects_bad_tokens() {
+    let key = BootstrapChallengeKey::from_bytes(b"test challenge key");
+    let state =
+        AppState::new_with_bootstrap(test_config(), None, Some(key.clone()), true, None, None);
+    assert!(state.authorize_hook_request(&mut HeaderMap::new()).is_err());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        crate::configuration::BOOTSTRAP_CLIENT_TOKEN_HEADER,
+        HeaderValue::from_str(&key.client_token()).unwrap(),
+    );
+    let hook_client_token = key.hook_client_token("test-hook-installation");
+    let expected_hook_owner = key.verify_hook_client_token(&hook_client_token).unwrap();
+    headers.insert(
+        crate::configuration::HOOK_CLIENT_TOKEN_HEADER,
+        HeaderValue::from_str(&hook_client_token).unwrap(),
+    );
+    let owner = state.authorize_hook_request(&mut headers).unwrap();
+    assert_eq!(owner, expected_hook_owner);
+    assert!(!headers.contains_key(crate::configuration::BOOTSTRAP_CLIENT_TOKEN_HEADER));
+    assert!(!headers.contains_key(crate::configuration::HOOK_CLIENT_TOKEN_HEADER));
+
+    let mut browser_headers = HeaderMap::new();
+    browser_headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://example.test"),
+    );
+    browser_headers.insert(
+        crate::configuration::BOOTSTRAP_CLIENT_TOKEN_HEADER,
+        HeaderValue::from_str(&key.client_token()).unwrap(),
+    );
+    assert!(state.authorize_hook_request(&mut browser_headers).is_err());
 }
 
 #[tokio::test]
@@ -2282,6 +2336,124 @@ async fn claude_code_hook_returns_continue_shape() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["continue"], json!(true));
+}
+
+#[tokio::test]
+async fn claude_permission_request_allows_an_exact_active_tool() {
+    let app = router(test_config());
+    let pre_tool = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/hooks/claude-code")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "claude-permission",
+                        "hook_event_name": "PreToolUse",
+                        "tool_use_id": "tool-1",
+                        "tool_name": "Read",
+                        "tool_input": {"file_path": "README.md"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pre_tool.status(), StatusCode::OK);
+    let bytes = pre_tool.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body, json!({"continue": true}));
+
+    let permission = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/hooks/claude-code")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "claude-permission",
+                        "hook_event_name": "PermissionRequest",
+                        "tool_name": "Read",
+                        "tool_input": {"file_path": "README.md"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(permission.status(), StatusCode::OK);
+    let bytes = permission.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["hookSpecificOutput"]["hookEventName"],
+        json!("PermissionRequest")
+    );
+    assert_eq!(
+        body["hookSpecificOutput"]["decision"]["behavior"],
+        json!("allow")
+    );
+
+    let second_pre_tool = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/hooks/claude-code")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "claude-permission",
+                        "hook_event_name": "PreToolUse",
+                        "tool_use_id": "tool-2",
+                        "tool_name": "Read",
+                        "tool_input": {"file_path": "README.md"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_pre_tool.status(), StatusCode::OK);
+
+    let ambiguous = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/hooks/claude-code")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "claude-permission",
+                        "hook_event_name": "PermissionRequest",
+                        "tool_name": "Read",
+                        "tool_input": {"file_path": "README.md"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ambiguous.status(), StatusCode::OK);
+    let bytes = ambiguous.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["hookSpecificOutput"]["decision"]["behavior"],
+        json!("deny")
+    );
+    assert!(
+        body["hookSpecificOutput"]["decision"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not match")
+    );
 }
 
 #[tokio::test]
