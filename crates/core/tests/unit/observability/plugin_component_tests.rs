@@ -4753,6 +4753,15 @@ fn atif_storage_defaults_to_empty() {
 
 #[test]
 fn atif_session_id_source_parses_opt_in_and_rejects_unknown_values() {
+    let report = validate_plugin_config(&plugin_config(json!({
+        "atif": {"session_id_source": "propagation_root"}
+    })));
+    assert!(
+        report.diagnostics.is_empty(),
+        "valid ATIF session ID source should not produce diagnostics: {:?}",
+        report.diagnostics
+    );
+
     let parsed: AtifSectionConfig = serde_json::from_value(json!({
         "session_id_source": "propagation_root"
     }))

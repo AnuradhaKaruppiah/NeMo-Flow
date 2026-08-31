@@ -3584,6 +3584,7 @@ fn validate_observability_section_fields(
             "model_name",
             "tool_definitions",
             "extra",
+            "session_id_source",
             "output_directory",
             "filename_template",
             "storage",
