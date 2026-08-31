@@ -457,8 +457,9 @@ pub struct AtofStreamSinkSectionConfig {
 ///
 /// When enabled, this section creates a dispatcher that opens a separate
 /// [`crate::observability::atif::AtifExporter`] for each top-level agent or turn scope. The
-/// `{session_id}` placeholder in [`AtifSectionConfig::filename_template`] is required so
-/// concurrent sibling trajectories cannot overwrite each other's files.
+/// historical `{session_id}` placeholder in [`AtifSectionConfig::filename_template`] expands to
+/// the trajectory scope UUID so concurrent sibling trajectories cannot overwrite each other's
+/// files, independently of [`AtifSectionConfig::session_id_source`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AtifSectionConfig {
@@ -480,16 +481,27 @@ pub struct AtifSectionConfig {
     /// Extra ATIF agent metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<Json>,
+    /// Source for the root trajectory's serialized ATIF `session_id`.
+    ///
+    /// `agent_scope` preserves the historical behavior of using the top-level trajectory scope
+    /// UUID. `propagation_root` uses that scope's parent UUID, which is the propagated root for a
+    /// top-level trajectory. Artifact filenames, storage keys, and `trajectory_id` continue to use
+    /// the trajectory scope UUID under either setting.
+    #[serde(default)]
+    pub session_id_source: AtifSessionIdSource,
     /// Directory containing trajectory JSON files. Ignored when [`storage`] is non-empty.
     ///
     /// [`storage`]: Self::storage
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_directory: Option<PathBuf>,
-    /// Filename template. `{session_id}` is replaced with the top-level trajectory scope UUID, and
-    /// `{metadata.<path>:-fallback}` placeholders sanitize strings from the top-level scope
-    /// metadata into path-safe filename fragments or use the optional literal fallback. When
-    /// [`storage`] is non-empty, the rendered filename is appended to each backend's key prefix.
+    /// Filename template. The historical `{session_id}` placeholder is always replaced with the
+    /// top-level trajectory scope UUID, even when [`session_id_source`] changes the serialized
+    /// ATIF `session_id`. `{metadata.<path>:-fallback}` placeholders sanitize strings from the
+    /// top-level scope metadata into path-safe filename fragments or use the optional literal
+    /// fallback. When [`storage`] is non-empty, the rendered filename is appended to each
+    /// backend's key prefix.
     ///
+    /// [`session_id_source`]: Self::session_id_source
     /// [`storage`]: Self::storage
     #[serde(default = "default_atif_filename_template")]
     pub filename_template: String,
@@ -514,11 +526,24 @@ impl Default for AtifSectionConfig {
             model_name: default_model_name(),
             tool_definitions: None,
             extra: None,
+            session_id_source: AtifSessionIdSource::default(),
             output_directory: None,
             filename_template: default_atif_filename_template(),
             storage: Vec::new(),
         }
     }
+}
+
+/// Source used for the root trajectory's serialized ATIF `session_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AtifSessionIdSource {
+    /// Preserve the historical behavior: use the top-level trajectory scope UUID.
+    #[default]
+    AgentScope,
+    /// Use the top-level trajectory scope's parent UUID, which is its propagated root.
+    PropagationRoot,
 }
 
 /// Remote storage destination for ATIF trajectory files.
@@ -989,6 +1014,7 @@ crate::editor_config! {
         model_name => { label: "model_name", kind: String },
         tool_definitions => { label: "tool_definitions", kind: List, optional: true, list: &crate::config_editor::JSON_LIST_ITEM },
         extra => { label: "extra", kind: Json, optional: true },
+        session_id_source => { label: "session_id_source", kind: Enum, values: ["agent_scope", "propagation_root"] },
         output_directory => { label: "output_directory", kind: String, optional: true },
         filename_template => { label: "filename_template", kind: String },
         storage => { label: "storage", kind: List, optional: true, list: &ATIF_STORAGE_LIST },
@@ -2558,33 +2584,41 @@ impl AtifDispatcher {
             return None;
         }
 
-        // The top-level trajectory scope UUID is the ATIF session ID. The global
-        // dispatcher records the start event itself because the scope-local
-        // subscriber is attached after that start event has already been
-        // emitted.
-        let session_id = event.uuid().to_string();
+        // Keep the trajectory scope UUID as the artifact identity even when the serialized ATIF
+        // session ID is sourced from the propagated root. The global dispatcher records the start
+        // event itself because the scope-local subscriber is attached after that start event has
+        // already been emitted.
+        let trajectory_id = event.uuid().to_string();
+        let session_id = match self.config.session_id_source {
+            AtifSessionIdSource::AgentScope => trajectory_id.clone(),
+            AtifSessionIdSource::PropagationRoot => event
+                .parent_uuid()
+                .expect("top-level trajectory starts always have a parent UUID")
+                .to_string(),
+        };
         let (filename, local_root, local_path) =
-            match self.prepare_destination(&session_id, event.metadata()) {
+            match self.prepare_destination(&trajectory_id, event.metadata()) {
                 Ok(destination) => destination,
                 Err(error) => {
                     self.record_runtime_failure(
                         "atif.destination_render_failed",
                         Some("filename_template".into()),
                         error.clone(),
-                        Some(session_id.clone()),
+                        Some(trajectory_id.clone()),
                     );
                     log::warn!(
                         target: "nemo_relay.observability",
                         event = "atif_destination_render_failed",
                         plugin_kind = OBSERVABILITY_PLUGIN_KIND,
                         exporter = "atif",
-                        session_id = session_id.as_str();
+                        trajectory_id = trajectory_id.as_str();
                         "ATIF destination rendering failed: {error}"
                     );
                     return None;
                 }
             };
-        let exporter = AtifExporter::new(session_id.clone(), self.agent_info());
+        let exporter =
+            AtifExporter::new_for_trajectory(session_id, trajectory_id, self.agent_info());
         (exporter.subscriber())(event);
         let correlation = AtifCorrelation::from_event(event);
         self.scope_owners.insert(event.uuid(), event.uuid());

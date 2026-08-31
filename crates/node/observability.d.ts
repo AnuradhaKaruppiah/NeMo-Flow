@@ -61,6 +61,7 @@ export interface AtifConfig {
   model_name?: string;
   tool_definitions?: Record<string, Json>[];
   extra?: Record<string, Json>;
+  session_id_source?: 'agent_scope' | 'propagation_root';
   output_directory?: string;
   filename_template?: string;
   storage?: S3StorageConfig | HttpStorageConfig | Array<S3StorageConfig | HttpStorageConfig>;

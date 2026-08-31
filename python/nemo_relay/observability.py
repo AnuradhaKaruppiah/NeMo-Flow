@@ -189,6 +189,7 @@ class AtifConfig:
     model_name: str = "unknown"
     tool_definitions: list[JsonObject] | None = None
     extra: JsonObject | None = None
+    session_id_source: Literal["agent_scope", "propagation_root"] = "agent_scope"
     output_directory: str | None = None
     filename_template: str = "nemo-relay-atif-{session_id}.json"
     storage: list[S3StorageConfig | HttpStorageConfig] | None = None
@@ -202,6 +203,7 @@ class AtifConfig:
             "model_name": self.model_name,
             "tool_definitions": self.tool_definitions,
             "extra": self.extra,
+            "session_id_source": self.session_id_source,
             "output_directory": self.output_directory,
             "filename_template": self.filename_template,
             "storage": self.storage,

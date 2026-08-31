@@ -8,8 +8,10 @@ use crate::api::event::{
     BaseEvent, DataSchema, EventCategory, METRIC_DATA_SCHEMA_NAME, METRIC_DATA_SCHEMA_VERSION,
     MarkEvent, ScopeEvent,
 };
-use crate::api::runtime::NemoRelayContextState;
-use crate::api::runtime::global_context;
+use crate::api::runtime::{
+    NemoRelayContextState, PropagationContext, create_scope_stack_from_propagation, global_context,
+    set_thread_scope_stack,
+};
 use crate::api::scope::{PopScopeParams, PushScopeParams};
 use crate::api::subscriber::scope_deregister_subscriber;
 use crate::config_editor::{EditorConfig, EditorFieldKind, EditorSchema};
@@ -817,6 +819,7 @@ fn default_config_and_component_conversion_cover_public_shape() {
     assert_eq!(atif.agent_name, "NeMo Relay");
     assert_eq!(atif.agent_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(atif.model_name, "unknown");
+    assert_eq!(atif.session_id_source, AtifSessionIdSource::AgentScope);
     assert_eq!(atif.filename_template, "nemo-relay-atif-{session_id}.json");
 
     let otel = OpenTelemetrySectionConfig {
@@ -2863,6 +2866,49 @@ fn atif_defaults_create_one_file_per_top_level_agent() {
 }
 
 #[test]
+fn atif_propagation_root_session_id_flows_through_plugin_e2e() {
+    let _guard = crate::observability::test_mutex().lock().unwrap();
+    reset_runtime();
+    let dir = temp_dir("observability-atif-propagation-root");
+    let request_id = Uuid::parse_str("018f47a4-3af7-7d94-8e61-9f0f89b5d312").unwrap();
+    let stack = create_scope_stack_from_propagation(&PropagationContext {
+        version: PropagationContext::VERSION,
+        root_uuid: Some(request_id),
+        parent_uuid: request_id,
+    })
+    .unwrap();
+    set_thread_scope_stack(stack);
+
+    let config = plugin_config(json!({
+        "atif": {
+            "enabled": true,
+            "session_id_source": "propagation_root",
+            "output_directory": dir,
+            "filename_template": "trajectory-{session_id}.json"
+        }
+    }));
+    futures::executor::block_on(initialize_plugins_exact(config)).unwrap();
+
+    let first = push_agent("first-propagated-agent");
+    pop(&first);
+    let second = push_agent("second-propagated-agent");
+    pop(&second);
+    clear_plugin_configuration().unwrap();
+
+    for agent in [&first, &second] {
+        let path = dir.join(format!("trajectory-{}.json", agent.uuid));
+        let trajectory: Json = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(trajectory["session_id"], request_id.to_string());
+        assert_eq!(trajectory["trajectory_id"], agent.uuid.to_string());
+        assert_eq!(
+            trajectory["extra"]["nemo_relay"]["session_instance_id"],
+            request_id.to_string()
+        );
+    }
+    assert_ne!(first.uuid, second.uuid);
+}
+
+#[test]
 fn atif_filename_template_sanitizes_metadata_paths() {
     let _guard = crate::observability::test_mutex().lock().unwrap();
     reset_runtime();
@@ -2938,6 +2984,7 @@ fn atif_routes_global_descendant_events_by_parent_uuid() {
     let child_uuid = Uuid::now_v7();
     let manager = Arc::new(Mutex::new(AtifDispatcher::new(AtifSectionConfig {
         enabled: true,
+        session_id_source: AtifSessionIdSource::PropagationRoot,
         output_directory: Some(dir.clone()),
         ..AtifSectionConfig::default()
     })));
@@ -3082,7 +3129,7 @@ fn atif_routes_global_descendant_events_by_parent_uuid() {
 
     let value: Json = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(value["trajectory_id"], agent_uuid.to_string());
-    assert_eq!(value["session_id"], agent_uuid.to_string());
+    assert_eq!(value["session_id"], root_uuid.to_string());
     assert_eq!(value["extra"]["nemo_relay"]["session_id"], "root-session");
     assert_eq!(
         value["extra"]["nemo_relay"]["session_instance_id"],
@@ -4702,6 +4749,24 @@ fn plugin_signal_rejections_record_runtime_diagnostics() {
 fn atif_storage_defaults_to_empty() {
     let config = AtifSectionConfig::default();
     assert!(config.storage.is_empty());
+}
+
+#[test]
+fn atif_session_id_source_parses_opt_in_and_rejects_unknown_values() {
+    let parsed: AtifSectionConfig = serde_json::from_value(json!({
+        "session_id_source": "propagation_root"
+    }))
+    .expect("propagation-root session ID source should parse");
+    assert_eq!(
+        parsed.session_id_source,
+        AtifSessionIdSource::PropagationRoot
+    );
+
+    let error = serde_json::from_value::<AtifSectionConfig>(json!({
+        "session_id_source": "request_metadata"
+    }))
+    .expect_err("unknown session ID source should be rejected");
+    assert!(error.to_string().contains("unknown variant"));
 }
 
 #[test]
