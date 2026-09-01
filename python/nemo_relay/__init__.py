@@ -478,7 +478,12 @@ def capture_propagation_context() -> PropagationContext:
 
 
 def capture_rootless_propagation_context() -> PropagationContext:
-    """Capture the current causal parent without a propagation root."""
+    """Capture the current causal parent without a propagation root.
+
+    Returns:
+        PropagationContext: Context with no root UUID, opting out of Relay
+            session propagation when it is installed in another scope stack.
+    """
     get_scope_stack()
     if parent_uuid := _propagation_parent_var.get():
         return PropagationContext(parent_uuid)

@@ -127,7 +127,6 @@ class TestObservabilityConfigHelpers:
             "enabled": False,
             "agent_name": "NeMo Relay",
             "model_name": "unknown",
-            "session_id_source": "agent_scope",
             "filename_template": "nemo-relay-atif-{session_id}.json",
         }
         assert OpenTelemetrySectionConfig().to_dict() == {
@@ -553,7 +552,6 @@ class TestObservabilityConfigHelpers:
                         ObservabilityConfig(
                             atif=AtifConfig(
                                 enabled=True,
-                                session_id_source="propagation_root",
                                 output_directory=str(tmp_path),
                                 filename_template="trajectory-{session_id}.json",
                             )

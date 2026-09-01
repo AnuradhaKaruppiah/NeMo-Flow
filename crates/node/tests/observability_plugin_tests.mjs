@@ -29,7 +29,6 @@ describe('observability plugin helpers', () => {
       enabled: false,
       agent_name: 'NeMo Relay',
       model_name: 'unknown',
-      session_id_source: 'agent_scope',
       filename_template: 'nemo-relay-atif-{session_id}.json',
     });
     assert.deepEqual(observability.openTelemetryConfig(), {

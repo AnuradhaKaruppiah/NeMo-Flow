@@ -35,6 +35,7 @@ pub struct ScopeStack {
     fresh_agents: HashSet<Uuid>,
     propagated_parent_uuid: Option<Uuid>,
     propagated_root_uuid: Option<Uuid>,
+    is_rootless_propagation: bool,
 }
 
 /// Versioned, transport-neutral causal context for crossing a Relay boundary.
@@ -122,6 +123,7 @@ impl ScopeStack {
             fresh_agents: self.fresh_agents.clone(),
             propagated_parent_uuid: self.propagated_parent_uuid,
             propagated_root_uuid: self.propagated_root_uuid,
+            is_rootless_propagation: self.is_rootless_propagation,
         }
     }
 
@@ -142,6 +144,7 @@ impl ScopeStack {
             fresh_agents: HashSet::from([root_uuid]),
             propagated_parent_uuid: None,
             propagated_root_uuid: None,
+            is_rootless_propagation: false,
         }
     }
 
@@ -184,6 +187,7 @@ impl ScopeStack {
             fresh_agents: HashSet::from([root_uuid]),
             propagated_parent_uuid: context.root_uuid.map(|_| context.parent_uuid),
             propagated_root_uuid: context.root_uuid,
+            is_rootless_propagation: context.root_uuid.is_none(),
         })
     }
 
@@ -248,7 +252,7 @@ impl ScopeStack {
 
     /// Return the causal root that should be attached to emitted events.
     pub(crate) fn event_propagation_root_uuid(&self) -> Option<Uuid> {
-        if self.propagated_parent_uuid.is_some() && self.propagated_root_uuid.is_none() {
+        if self.is_rootless_propagation {
             None
         } else {
             Some(self.observability_root_uuid())

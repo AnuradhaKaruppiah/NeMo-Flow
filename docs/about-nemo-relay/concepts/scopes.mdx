@@ -265,8 +265,10 @@ it to isolate concurrent branches that begin in the same synchronous callback.
 
 When work crosses a process or remote-workflow boundary, applications can carry
 the versioned Relay propagation context instead of a native stack handle. The
-context contains an immediate `parent_uuid` and a `root_uuid`. By default,
-Relay uses the propagated root or the first local Agent scope as that root.
+context contains an immediate `parent_uuid` and an optional `root_uuid`.
+Rooted contexts carry a root UUID; explicit rootless contexts carry `None`.
+By default, Relay uses the propagated root or the first local Agent scope as
+that root.
 
 The receiver creates a fresh isolated stack from that context and installs it
 only for request handling. Its first local event becomes a child of

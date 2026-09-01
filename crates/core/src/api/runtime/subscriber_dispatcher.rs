@@ -1155,7 +1155,8 @@ mod native {
         publication_context: Option<PublicationContext>,
     ) -> (Option<Event>, Vec<DispatcherMessage>) {
         let state = process_state();
-        let (transformed, mut nested_publications) = match transform {
+        let propagation_root_uuid = event.propagation_root_uuid();
+        let (mut transformed, mut nested_publications) = match transform {
             Some(transform) => {
                 let runtime = match build_sanitizer_invocation_runtime() {
                     Ok(runtime) => runtime,
@@ -1198,6 +1199,7 @@ mod native {
             }
             None => (event, Vec::new()),
         };
+        transformed.set_propagation_root_uuid(propagation_root_uuid);
         let (injected, injector_publications) =
             inject_event_metadata_snapshot(transformed, injectors, publication_context.clone());
         nested_publications.extend(injector_publications);

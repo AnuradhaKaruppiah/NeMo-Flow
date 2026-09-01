@@ -641,11 +641,12 @@ fn make_start_event(
 #[test]
 fn propagated_root_parent_projects_as_a_remote_otel_parent() {
     let root_uuid = Uuid::now_v7();
+    let parent_uuid = Uuid::now_v7();
     let _restore_guard = RestoreThreadScopeStackGuard(capture_thread_scope_stack());
     let imported_stack = create_scope_stack_from_propagation(&PropagationContext {
         version: PropagationContext::VERSION,
         root_uuid: Some(root_uuid),
-        parent_uuid: root_uuid,
+        parent_uuid,
     })
     .unwrap();
     set_thread_scope_stack(imported_stack);
@@ -653,7 +654,7 @@ fn propagated_root_parent_projects_as_a_remote_otel_parent() {
     let processor = OtelEventProcessor::new(make_provider().0, "test".into());
     let mut event = make_start_event(
         Uuid::now_v7(),
-        Some(root_uuid),
+        Some(parent_uuid),
         "receiver-tool",
         ScopeType::Tool,
         None,
@@ -664,7 +665,7 @@ fn propagated_root_parent_projects_as_a_remote_otel_parent() {
     let span_context = parent_span.span_context();
     assert!(span_context.is_remote());
     assert_eq!(span_context.trace_id(), relay_trace_id(root_uuid));
-    assert_eq!(span_context.span_id(), relay_span_id(root_uuid));
+    assert_eq!(span_context.span_id(), relay_span_id(parent_uuid));
 }
 
 #[test]
@@ -678,6 +679,7 @@ fn rootless_propagation_starts_a_new_otel_trace() {
         parent_uuid,
     })
     .unwrap();
+    let propagation_root_uuid = imported_stack.read().unwrap().event_propagation_root_uuid();
     set_thread_scope_stack(imported_stack);
 
     let captured = capture_rootless_propagation_context().unwrap();
@@ -694,13 +696,16 @@ fn rootless_propagation_starts_a_new_otel_trace() {
 
     let (provider, exporter) = make_provider();
     let mut processor = OtelEventProcessor::new(provider, "test".into());
-    processor.process(&make_start_event(
+    let mut start = make_start_event(
         local_uuid,
         Some(parent_uuid),
         "receiver-tool",
         ScopeType::Tool,
         None,
-    ));
+    );
+    start.set_propagation_root_uuid(propagation_root_uuid);
+    assert_eq!(start.propagation_root_uuid(), None);
+    processor.process(&start);
     processor.process(&make_end_event(
         local_uuid,
         Some(parent_uuid),
@@ -1896,6 +1901,11 @@ fn mapped_aliases_are_typed_and_cannot_replace_projected_span_fields() {
     );
 }
 
+fn with_propagation_root(mut event: Event, root_uuid: Uuid) -> Event {
+    event.set_propagation_root_uuid(Some(root_uuid));
+    event
+}
+
 #[test]
 fn session_identity_is_projected_on_trace_roots_and_marks_only() {
     let (provider, exporter) = make_provider();
@@ -1904,71 +1914,79 @@ fn session_identity_is_projected_on_trace_roots_and_marks_only() {
     let root_uuid = Uuid::now_v7();
     let child_uuid = Uuid::now_v7();
     let second_root_uuid = Uuid::now_v7();
-    let instance_id = crate::api::runtime::current_scope_stack()
-        .read()
-        .unwrap()
-        .root_uuid()
-        .to_string();
+    let instance_id = root_uuid.to_string();
+    let second_instance_id = second_root_uuid.to_string();
     let identity = json!({
         "session_id": "logical-session",
         "user_id": "alice",
         "agent_kind": "claude-code"
     });
 
-    callback(&make_start_event_with_metadata(
+    callback(&with_propagation_root(
+        make_start_event_with_metadata(root_uuid, None, "identity-root", identity.clone()),
         root_uuid,
-        None,
-        "identity-root",
-        identity.clone(),
     ));
-    callback(&make_start_event_with_metadata(
-        child_uuid,
-        Some(root_uuid),
-        "identity-child",
-        identity.clone(),
-    ));
-    callback(&make_mark_event_with_metadata(
-        Some(root_uuid),
-        identity.clone(),
-    ));
-    callback(&make_end_event(
-        child_uuid,
-        Some(root_uuid),
-        "identity-child",
-        ScopeType::Agent,
-        None,
-    ));
-    callback(&make_end_event(
+    callback(&with_propagation_root(
+        make_start_event_with_metadata(
+            child_uuid,
+            Some(root_uuid),
+            "identity-child",
+            identity.clone(),
+        ),
         root_uuid,
-        None,
-        "identity-root",
-        ScopeType::Agent,
-        None,
     ));
-    callback(&make_start_event_with_metadata(
+    callback(&with_propagation_root(
+        make_mark_event_with_metadata(Some(root_uuid), identity.clone()),
+        root_uuid,
+    ));
+    callback(&with_propagation_root(
+        make_end_event(
+            child_uuid,
+            Some(root_uuid),
+            "identity-child",
+            ScopeType::Agent,
+            None,
+        ),
+        root_uuid,
+    ));
+    callback(&with_propagation_root(
+        make_end_event(root_uuid, None, "identity-root", ScopeType::Agent, None),
+        root_uuid,
+    ));
+    callback(&with_propagation_root(
+        make_start_event_with_metadata(
+            second_root_uuid,
+            None,
+            "identity-second-root",
+            json!({"session_id": "logical-session", "user_id": 42}),
+        ),
         second_root_uuid,
-        None,
-        "identity-second-root",
-        json!({"session_id": "logical-session", "user_id": 42}),
     ));
-    callback(&make_end_event(
+    callback(&with_propagation_root(
+        make_end_event(
+            second_root_uuid,
+            None,
+            "identity-second-root",
+            ScopeType::Agent,
+            None,
+        ),
         second_root_uuid,
-        None,
-        "identity-second-root",
-        ScopeType::Agent,
-        None,
     ));
-    callback(&make_mark_event_with_metadata(None, identity));
+    callback(&with_propagation_root(
+        make_mark_event_with_metadata(None, identity),
+        root_uuid,
+    ));
     subscriber.force_flush().unwrap();
 
     let spans = exporter.get_finished_spans().unwrap();
-    assert_session_root_and_child_identity(&spans, &instance_id);
+    assert_session_root_and_child_identity(&spans, &instance_id, &second_instance_id);
     assert_session_mark_identity(&spans);
 }
 
 fn assert_session_root_and_child_identity(
     spans: &[opentelemetry_sdk::trace::SpanData],
     instance_id: &str,
+    second_instance_id: &str,
 ) {
     let root = finished_span_named(spans, "identity-root");
     let child = finished_span_named(spans, "identity-child");
@@ -2007,7 +2025,7 @@ fn assert_session_root_and_child_identity(
     );
     assert_eq!(
         second_root_attributes["nemo_relay.session.instance_id"],
-        root_attributes["nemo_relay.session.instance_id"]
+        second_instance_id
     );
     assert_ne!(
         root.span_context.trace_id(),
