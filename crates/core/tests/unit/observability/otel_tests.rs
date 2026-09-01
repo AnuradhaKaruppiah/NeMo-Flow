@@ -669,7 +669,7 @@ fn propagated_root_parent_projects_as_a_remote_otel_parent() {
 }
 
 #[test]
-fn rootless_propagation_starts_a_new_otel_trace() {
+fn rootless_propagation_remains_rootless_when_forked() {
     let parent_uuid = Uuid::now_v7();
     let local_uuid = Uuid::now_v7();
     let _restore_guard = RestoreThreadScopeStackGuard(capture_thread_scope_stack());
@@ -679,7 +679,6 @@ fn rootless_propagation_starts_a_new_otel_trace() {
         parent_uuid,
     })
     .unwrap();
-    let propagation_root_uuid = imported_stack.read().unwrap().event_propagation_root_uuid();
     set_thread_scope_stack(imported_stack);
 
     let captured = capture_rootless_propagation_context().unwrap();
@@ -692,7 +691,10 @@ fn rootless_propagation_starts_a_new_otel_trace() {
         assert_eq!(forked_stack.root_uuid(), parent_uuid);
         assert_eq!(forked_stack.top().uuid, parent_uuid);
     }
-    set_thread_scope_stack(forked_stack);
+    let propagation_root_uuid = forked_stack.read().unwrap().event_propagation_root_uuid();
+    set_thread_scope_stack(forked_stack.clone());
+    let forked_context = capture_propagation_context().unwrap();
+    assert_eq!(forked_context.root_uuid, None);
 
     let (provider, exporter) = make_provider();
     let mut processor = OtelEventProcessor::new(provider, "test".into());

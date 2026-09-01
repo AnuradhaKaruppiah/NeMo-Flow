@@ -278,7 +278,8 @@ before importing it. Relay does not send headers, make IPC connections, or
 trust remote identifiers automatically.
 
 The default `capture_propagation_context()` API preserves Relay event parentage
-and OpenTelemetry trace continuity. Use
+and, when a root is available, OpenTelemetry trace continuity. Forking an
+explicit rootless context keeps it rootless until a local Agent scope establishes a new root. Use
 `capture_rootless_propagation_context()` only when the receiver must start a
 new trace. `capture_propagation_context_with_root()` still lets an application
 choose a stable run UUID explicitly.

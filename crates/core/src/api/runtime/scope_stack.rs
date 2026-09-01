@@ -237,8 +237,8 @@ impl ScopeStack {
             .uuid
     }
 
-    /// Return the stable root used for propagated observability lineage.
-    pub(crate) fn observability_root_uuid(&self) -> Uuid {
+    /// Return the causal root that should be attached to emitted events.
+    pub(crate) fn event_propagation_root_uuid(&self) -> Option<Uuid> {
         self.propagated_root_uuid
             .or_else(|| {
                 self.stack
@@ -247,16 +247,7 @@ impl ScopeStack {
                     .find(|scope| scope.scope_type == ScopeType::Agent)
                     .map(|scope| scope.uuid)
             })
-            .unwrap_or_else(|| self.root_uuid())
-    }
-
-    /// Return the causal root that should be attached to emitted events.
-    pub(crate) fn event_propagation_root_uuid(&self) -> Option<Uuid> {
-        if self.is_rootless_propagation {
-            None
-        } else {
-            Some(self.observability_root_uuid())
-        }
+            .or_else(|| (!self.is_rootless_propagation).then(|| self.root_uuid()))
     }
 
     /// Whether `uuid` is the synthetic parent imported from propagation.
@@ -524,10 +515,12 @@ pub fn fork_scope_stack() -> Result<ScopeStackHandle> {
     create_scope_stack_from_propagation(&context)
 }
 
-/// Capture the current causal parent and its stable Relay root.
+/// Capture the current causal parent and its Relay root when available.
 ///
-/// Importing the returned context preserves Relay event parentage and continues
-/// the originating Relay-derived observability trace. Use
+/// Importing the returned context preserves Relay event parentage. A rootless
+/// imported stack remains rootless until a local Agent scope establishes a new
+/// root; otherwise the context continues the originating Relay-derived
+/// observability trace. Use
 /// [`capture_rootless_propagation_context`] when the receiver must start a new
 /// trace instead.
 pub fn capture_propagation_context() -> Result<PropagationContext> {
@@ -537,10 +530,10 @@ pub fn capture_propagation_context() -> Result<PropagationContext> {
     let stack_guard = stack
         .read()
         .map_err(|error| FlowError::Internal(error.to_string()))?;
-    let root_uuid = stack_guard.observability_root_uuid();
+    let root_uuid = stack_guard.event_propagation_root_uuid();
     Ok(PropagationContext {
         version: PropagationContext::VERSION,
-        root_uuid: Some(root_uuid),
+        root_uuid,
         parent_uuid,
     })
 }
