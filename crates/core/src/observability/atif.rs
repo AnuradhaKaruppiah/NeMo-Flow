@@ -360,7 +360,7 @@ impl AtifExporter {
         Self::new_for_trajectory(session_id.clone(), session_id, agent_info)
     }
 
-    /// Create an exporter whose run-scoped session ID differs from its root trajectory ID.
+    /// Create an exporter whose session and root trajectory identifiers differ.
     pub(crate) fn new_for_trajectory(
         session_id: String,
         trajectory_id: String,

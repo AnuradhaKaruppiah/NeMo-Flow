@@ -233,6 +233,28 @@ impl ScopeStack {
             .uuid
     }
 
+    /// Return the stable root used for propagated observability lineage.
+    pub(crate) fn observability_root_uuid(&self) -> Uuid {
+        self.propagated_root_uuid
+            .or_else(|| {
+                self.stack
+                    .iter()
+                    .skip(1)
+                    .find(|scope| scope.scope_type == ScopeType::Agent)
+                    .map(|scope| scope.uuid)
+            })
+            .unwrap_or_else(|| self.root_uuid())
+    }
+
+    /// Return the causal root that should be attached to emitted events.
+    pub(crate) fn event_propagation_root_uuid(&self) -> Option<Uuid> {
+        if self.propagated_parent_uuid.is_some() && self.propagated_root_uuid.is_none() {
+            None
+        } else {
+            Some(self.observability_root_uuid())
+        }
+    }
+
     /// Whether `uuid` is the synthetic parent imported from propagation.
     pub fn is_propagated_parent(&self, uuid: Uuid) -> bool {
         self.propagated_parent_uuid == Some(uuid)
@@ -478,9 +500,7 @@ pub fn create_scope_stack_from_propagation(
 ///
 /// Capture the parent before spawning concurrent work, then install the
 /// returned stack with `TASK_SCOPE_STACK.scope(...)`. The fork preserves event
-/// parentage but does not transfer scope-local registrations. Because the fork
-/// does not assert a root UUID, its first local OpenTelemetry span starts a new
-/// trace.
+/// parentage and its Relay root but does not transfer scope-local registrations.
 ///
 /// # Examples
 ///
@@ -500,13 +520,32 @@ pub fn fork_scope_stack() -> Result<ScopeStackHandle> {
     create_scope_stack_from_propagation(&context)
 }
 
-/// Capture the current causal parent without asserting a session root.
+/// Capture the current causal parent and its stable Relay root.
+///
+/// Importing the returned context preserves Relay event parentage and continues
+/// the originating Relay-derived observability trace. Use
+/// [`capture_rootless_propagation_context`] when the receiver must start a new
+/// trace instead.
+pub fn capture_propagation_context() -> Result<PropagationContext> {
+    let active_uuid = active_event_uuid();
+    let parent_uuid = active_uuid.unwrap_or_else(|| task_scope_top().uuid);
+    let stack = current_scope_stack();
+    let stack_guard = stack
+        .read()
+        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    let root_uuid = stack_guard.observability_root_uuid();
+    Ok(PropagationContext {
+        version: PropagationContext::VERSION,
+        root_uuid: Some(root_uuid),
+        parent_uuid,
+    })
+}
+
+/// Capture the current causal parent without a root UUID.
 ///
 /// Importing the returned context preserves Relay event parentage but starts a
-/// new local OpenTelemetry trace. Use [`capture_propagation_context_with_root`]
-/// when the receiver should participate in a Relay-derived trace rooted at a
-/// stable application UUID.
-pub fn capture_propagation_context() -> Result<PropagationContext> {
+/// new local OpenTelemetry trace.
+pub fn capture_rootless_propagation_context() -> Result<PropagationContext> {
     capture_propagation_context_with_root(None)
 }
 

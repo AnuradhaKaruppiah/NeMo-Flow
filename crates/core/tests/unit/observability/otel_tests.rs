@@ -10,8 +10,9 @@ use crate::api::event::{
 };
 use crate::api::runtime::{
     NemoRelayContextState, PropagationContext, ThreadScopeStackBinding,
-    capture_propagation_context, capture_thread_scope_stack, create_scope_stack_from_propagation,
-    fork_scope_stack, global_context, restore_thread_scope_stack, set_thread_scope_stack,
+    capture_propagation_context, capture_rootless_propagation_context, capture_thread_scope_stack,
+    create_scope_stack_from_propagation, fork_scope_stack, global_context,
+    restore_thread_scope_stack, set_thread_scope_stack,
 };
 use crate::api::scope::ScopeType;
 use crate::api::scope::{event, pop_scope, push_scope};
@@ -650,13 +651,15 @@ fn propagated_root_parent_projects_as_a_remote_otel_parent() {
     set_thread_scope_stack(imported_stack);
 
     let processor = OtelEventProcessor::new(make_provider().0, "test".into());
-    let parent_context = processor.parent_context(&make_start_event(
+    let mut event = make_start_event(
         Uuid::now_v7(),
         Some(root_uuid),
         "receiver-tool",
         ScopeType::Tool,
         None,
-    ));
+    );
+    event.set_propagation_root_uuid(Some(root_uuid));
+    let parent_context = processor.parent_context(&event);
     let parent_span = parent_context.span();
     let span_context = parent_span.span_context();
     assert!(span_context.is_remote());
@@ -677,7 +680,7 @@ fn rootless_propagation_starts_a_new_otel_trace() {
     .unwrap();
     set_thread_scope_stack(imported_stack);
 
-    let captured = capture_propagation_context().unwrap();
+    let captured = capture_rootless_propagation_context().unwrap();
     assert_eq!(captured.root_uuid, None);
     assert_eq!(captured.parent_uuid, parent_uuid);
 
@@ -714,6 +717,24 @@ fn rootless_propagation_starts_a_new_otel_trace() {
     assert_eq!(span.span_context.span_id(), relay_span_id(local_uuid));
     assert_eq!(span.parent_span_id, SpanId::INVALID);
     assert!(!span.parent_span_is_remote);
+}
+
+#[test]
+fn default_propagation_context_preserves_the_imported_root() {
+    let root_uuid = Uuid::now_v7();
+    let parent_uuid = Uuid::now_v7();
+    let _restore_guard = RestoreThreadScopeStackGuard(capture_thread_scope_stack());
+    let imported_stack = create_scope_stack_from_propagation(&PropagationContext {
+        version: PropagationContext::VERSION,
+        root_uuid: Some(root_uuid),
+        parent_uuid,
+    })
+    .unwrap();
+    set_thread_scope_stack(imported_stack);
+
+    let captured = capture_propagation_context().unwrap();
+    assert_eq!(captured.root_uuid, Some(root_uuid));
+    assert_eq!(captured.parent_uuid, parent_uuid);
 }
 
 #[test]

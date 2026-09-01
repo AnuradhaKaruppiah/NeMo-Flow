@@ -819,7 +819,6 @@ fn default_config_and_component_conversion_cover_public_shape() {
     assert_eq!(atif.agent_name, "NeMo Relay");
     assert_eq!(atif.agent_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(atif.model_name, "unknown");
-    assert_eq!(atif.session_id_source, AtifSessionIdSource::AgentScope);
     assert_eq!(atif.filename_template, "nemo-relay-atif-{session_id}.json");
 
     let otel = OpenTelemetrySectionConfig {
@@ -2882,7 +2881,6 @@ fn atif_propagation_root_session_id_flows_through_plugin_e2e() {
     let config = plugin_config(json!({
         "atif": {
             "enabled": true,
-            "session_id_source": "propagation_root",
             "output_directory": dir,
             "filename_template": "trajectory-{session_id}.json"
         }
@@ -2984,7 +2982,6 @@ fn atif_routes_global_descendant_events_by_parent_uuid() {
     let child_uuid = Uuid::now_v7();
     let manager = Arc::new(Mutex::new(AtifDispatcher::new(AtifSectionConfig {
         enabled: true,
-        session_id_source: AtifSessionIdSource::PropagationRoot,
         output_directory: Some(dir.clone()),
         ..AtifSectionConfig::default()
     })));
@@ -4749,33 +4746,6 @@ fn plugin_signal_rejections_record_runtime_diagnostics() {
 fn atif_storage_defaults_to_empty() {
     let config = AtifSectionConfig::default();
     assert!(config.storage.is_empty());
-}
-
-#[test]
-fn atif_session_id_source_parses_opt_in_and_rejects_unknown_values() {
-    let report = validate_plugin_config(&plugin_config(json!({
-        "atif": {"session_id_source": "propagation_root"}
-    })));
-    assert!(
-        report.diagnostics.is_empty(),
-        "valid ATIF session ID source should not produce diagnostics: {:?}",
-        report.diagnostics
-    );
-
-    let parsed: AtifSectionConfig = serde_json::from_value(json!({
-        "session_id_source": "propagation_root"
-    }))
-    .expect("propagation-root session ID source should parse");
-    assert_eq!(
-        parsed.session_id_source,
-        AtifSessionIdSource::PropagationRoot
-    );
-
-    let error = serde_json::from_value::<AtifSectionConfig>(json!({
-        "session_id_source": "request_metadata"
-    }))
-    .expect_err("unknown session ID source should be rejected");
-    assert!(error.to_string().contains("unknown variant"));
 }
 
 #[test]
